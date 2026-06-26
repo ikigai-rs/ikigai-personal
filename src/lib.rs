@@ -215,7 +215,7 @@ mod tests {
         let out = text("urn:personal:calendar", &freebusy);
         assert!(out.contains("busy"));
         assert!(!out.contains("Design review")); // detail withheld
-        // …and that capability cannot reach contacts.
+                                                 // …and that capability cannot reach contacts.
         assert!(source("urn:personal:contacts", &freebusy).is_err());
     }
 
