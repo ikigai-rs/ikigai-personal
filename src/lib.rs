@@ -176,6 +176,9 @@ mod tests {
         ))
     }
 
+    // Only the macOS-gated tests below read the body out; gate the helper to
+    // match, or it's dead code on other platforms (Linux CI) under -D warnings.
+    #[cfg(target_os = "macos")]
     fn text(iri: &str, capability: &Capability) -> String {
         String::from_utf8(source(iri, capability).unwrap().bytes).unwrap()
     }
