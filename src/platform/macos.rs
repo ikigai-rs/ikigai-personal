@@ -206,7 +206,7 @@ fn events_impl(
     let mut out = Vec::new();
     for i in 0..found.count() {
         let event = found.objectAtIndex(i);
-        let uid = unsafe { event.calendarItemExternalIdentifier() }
+        let store_uid = unsafe { event.calendarItemExternalIdentifier() }
             .map(|s| s.to_string())
             .unwrap_or_else(|| unsafe { event.calendarItemIdentifier() }.to_string());
         let title = unsafe { event.title() }.to_string();
@@ -215,6 +215,9 @@ fn events_impl(
             .unwrap_or_else(|| "(no calendar)".to_string());
         let start = rfc3339_local(unsafe { event.startDate().timeIntervalSince1970() });
         let end = rfc3339_local(unsafe { event.endDate().timeIntervalSince1970() });
+        // One EKEvent per OCCURRENCE, but occurrences of a recurring event share
+        // the store UID — qualify by date so each occurrence is its own subject.
+        let uid = super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start);
         let location = unsafe { event.location() }.map(|s| s.to_string());
         out.push(super::EventInfo {
             uid,

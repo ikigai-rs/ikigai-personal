@@ -45,3 +45,31 @@ pub struct EventInfo {
     /// The location, when set.
     pub location: Option<String>,
 }
+
+/// The skolemization id for one fetched event: recurring events share one
+/// store UID across occurrences, so each occurrence is qualified by its start
+/// date — otherwise every occurrence collapses onto one graph subject (an
+/// "event" with several dtstarts). Mirrors the org side's `…-YYYY-MM-DD`.
+pub fn occurrence_uid(store_uid: &str, recurring: bool, start_rfc3339: &str) -> String {
+    if recurring {
+        let date = start_rfc3339.split('T').next().unwrap_or(start_rfc3339);
+        format!("{store_uid}-{date}")
+    } else {
+        store_uid.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn recurring_occurrences_get_distinct_uids() {
+        let a = super::occurrence_uid("UID1", true, "2026-06-29T10:00:00-07:00");
+        let b = super::occurrence_uid("UID1", true, "2026-06-30T10:00:00-07:00");
+        assert_ne!(a, b);
+        assert_eq!(a, "UID1-2026-06-29");
+        assert_eq!(
+            super::occurrence_uid("UID2", false, "2026-07-11T19:00:00-07:00"),
+            "UID2"
+        );
+    }
+}
