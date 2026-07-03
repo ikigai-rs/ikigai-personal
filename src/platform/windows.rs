@@ -20,3 +20,11 @@ pub fn calendar() -> Option<String> {
 pub fn availability() -> Option<String> {
     None
 }
+
+pub fn calendars() -> Option<Result<Vec<super::CalendarInfo>, String>> {
+    None
+}
+
+pub fn create_calendar(_name: &str, _account: Option<&str>) -> Option<Result<String, String>> {
+    None
+}
