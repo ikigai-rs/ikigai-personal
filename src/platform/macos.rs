@@ -33,6 +33,24 @@ use objc2_foundation::{NSError, NSString};
 /// it in System Settings). Created per call: cheap, and nothing Objective-C
 /// crosses a thread boundary.
 fn store() -> Result<Retained<EKEventStore>, String> {
+    // ONE store per thread, reused: EventKit populates a fresh store's calendar
+    // cache asynchronously, so rapid-fire store creation (a derivation pass
+    // makes many calls) can race it into a briefly-incomplete calendar list —
+    // seen live as "no calendar named X" for a calendar that exists. Apple's
+    // guidance is to hold a long-lived store; per-thread keeps it !Send-safe.
+    thread_local! {
+        static STORE: std::cell::RefCell<Option<Retained<EKEventStore>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(existing) = STORE.with(|cell| cell.borrow().clone()) {
+        return Ok(existing);
+    }
+    let created = fresh_store()?;
+    STORE.with(|cell| *cell.borrow_mut() = Some(created.clone()));
+    Ok(created)
+}
+
+fn fresh_store() -> Result<Retained<EKEventStore>, String> {
     let status = unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
     let store = unsafe { EKEventStore::new() };
     if status == EKAuthorizationStatus::FullAccess {
