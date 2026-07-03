@@ -746,6 +746,15 @@ pub fn space(config: Option<CalendarConfig>) -> EndpointSpace {
         )
 }
 
+/// Observe the OS calendar store: `on_change` fires on ANY store change — an
+/// edit in another app, an accepted invitation, an iCloud sync from another
+/// device. Returns false where the platform has no observer. A golden-thread
+/// freshness source: hosts use it to trigger derivations (and later to make
+/// calendar reads cacheable-because-watched).
+pub fn observe_calendar_changes(on_change: Box<dyn Fn() + Send>) -> bool {
+    platform::observe_store(on_change).is_some()
+}
+
 /// Whether a personal backend is implemented for the platform this was built for.
 pub fn is_supported() -> bool {
     platform::SUPPORTED

@@ -398,3 +398,38 @@ fn delete_event_impl(
         "no event with uid {uid} in {calendar} within the window"
     ))
 }
+
+/// Run `on_change` whenever the event store reports ANY change — an edit in
+/// Calendar.app, an accepted invitation, an iCloud sync from another device.
+/// The observer lives on a dedicated thread whose runloop services the
+/// framework's delivery; the store, queue, and token are intentionally leaked
+/// (process-lifetime observation). The freshness source that makes calendar
+/// reactions event-driven instead of polled.
+pub fn observe_store(on_change: Box<dyn Fn() + Send>) -> Option<()> {
+    std::thread::spawn(move || {
+        use objc2_foundation::{NSNotificationCenter, NSOperationQueue, NSRunLoop};
+
+        let Ok(store) = store() else { return };
+        let queue = unsafe { NSOperationQueue::new() };
+        let block = block2::RcBlock::new(
+            move |_notification: core::ptr::NonNull<objc2_foundation::NSNotification>| {
+                on_change();
+            },
+        );
+        let token = unsafe {
+            NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                Some(objc2_event_kit::EKEventStoreChangedNotification),
+                Some(&store),
+                Some(&queue),
+                &block,
+            )
+        };
+        // Keep everything alive for the life of the process.
+        std::mem::forget(token);
+        std::mem::forget(store);
+        std::mem::forget(queue);
+        // Service this thread's runloop so the framework's sources deliver.
+        unsafe { NSRunLoop::currentRunLoop().run() };
+    });
+    Some(())
+}
