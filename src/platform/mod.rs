@@ -16,7 +16,8 @@
 mod imp;
 
 pub use imp::{
-    calendars, contacts, create_calendar, create_event, delete_event, events, NAME, SUPPORTED,
+    calendars, contacts, create_calendar, create_event, delete_event, events, observe_store, NAME,
+    SUPPORTED,
 };
 
 /// One native calendar, as the OS reports it.

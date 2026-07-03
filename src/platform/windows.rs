@@ -49,3 +49,7 @@ pub fn delete_event(
 ) -> Option<Result<String, String>> {
     None
 }
+
+pub fn observe_store(_on_change: Box<dyn Fn() + Send>) -> Option<()> {
+    None
+}
