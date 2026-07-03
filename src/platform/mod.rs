@@ -15,7 +15,7 @@
 )]
 mod imp;
 
-pub use imp::{availability, calendar, calendars, contacts, create_calendar, NAME, SUPPORTED};
+pub use imp::{calendars, contacts, create_calendar, events, NAME, SUPPORTED};
 
 /// One native calendar, as the OS reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,4 +24,24 @@ pub struct CalendarInfo {
     pub title: String,
     /// The account (EventKit source) it lives on, e.g. "iCloud".
     pub account: String,
+}
+
+/// One calendar event, normalized from the OS store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventInfo {
+    /// The event's stable external identifier (the iCal UID on iCloud) — the
+    /// natural key events are skolemized under (`urn:event:{uid}`), the same
+    /// identity the org ingestion records.
+    pub uid: String,
+    /// The event title.
+    pub title: String,
+    /// The native calendar it lives on, e.g. "Bosatsu".
+    pub calendar: String,
+    /// Start/end as RFC 3339 local timestamps.
+    pub start: String,
+    pub end: String,
+    /// An all-day event (start/end are dates, times are midnight).
+    pub all_day: bool,
+    /// The location, when set.
+    pub location: Option<String>,
 }
