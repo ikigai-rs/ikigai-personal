@@ -6,12 +6,13 @@
 //!
 //! ## Platform support
 //!
-//! macOS is the first backend. **Windows and Linux are placeholders today**: the
-//! crate *builds* on them, but the personal resources resolve to a clear
-//! "not supported yet" error until their backends land (Windows: Microsoft Graph
-//! / Active Directory; Linux: LDAP / CalDAV / D-Bus). The macOS backend currently
-//! returns clearly-labelled **sample data** pending the real Contacts/EventKit
-//! integration.
+//! macOS is the first backend, and its calendar side is **real EventKit**
+//! (via `objc2`): list/create calendars, read/search/write/delete events —
+//! including the TCC full-access flow. Contacts remain sample data pending the
+//! Contacts.framework slice. **Windows and Linux are placeholders**: the crate
+//! *builds* on them, but the personal resources resolve to a clear "not
+//! supported yet" error until their backends land (Windows: Microsoft Graph /
+//! Active Directory; Linux: LDAP / CalDAV / D-Bus).
 //!
 //! ## Capability scoping
 //!
