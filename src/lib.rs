@@ -106,6 +106,11 @@ fn period_range(period: &str, today: NaiveDate) -> Result<(i64, i64, String)> {
             )
         }
         "month" => month_range(today.year(), today.month()),
+        "year" => {
+            let jan1 = NaiveDate::from_ymd_opt(today.year(), 1, 1).expect("jan 1");
+            let next = NaiveDate::from_ymd_opt(today.year() + 1, 1, 1).expect("jan 1");
+            (jan1, next, format!("{}", today.year()))
+        }
         "january" | "february" | "march" | "april" | "may" | "june" | "july" | "august"
         | "september" | "october" | "november" | "december" => {
             let month = [
@@ -149,7 +154,7 @@ fn period_range(period: &str, today: NaiveDate) -> Result<(i64, i64, String)> {
 
 fn bad_period(period: &str) -> Error {
     Error::Endpoint(format!(
-        "urn:personal:calendar:{period}: unknown period — try today, tomorrow, week, month, \
+        "urn:personal:calendar:{period}: unknown period — try today, tomorrow, week, month, year, \
          a month name, YYYY-MM, or YYYY-MM-DD"
     ))
 }
@@ -331,15 +336,37 @@ pub fn calendar() -> FnEndpoint {
                 "urn:cap:personal:calendar:read:detail",
             ));
         }
-        let Some((label, events)) = events_for(inv)? else {
+        // q= searches titles/locations — that IS reading detail: a freebusy
+        // holder probing q= would have a title oracle, so gate it loudly.
+        let query = inv.inline_str("q").ok();
+        if query.is_some() && !detail {
+            return Err(denied(
+                "calendar (q= searches titles)",
+                "urn:cap:personal:calendar:read:detail",
+            ));
+        }
+        let Some((label, mut events)) = events_for(inv)? else {
             return resolve("calendar", None);
         };
+        if let Some(q) = query {
+            let needle = q.to_lowercase();
+            events.retain(|e| {
+                e.title.to_lowercase().contains(&needle)
+                    || e.location
+                        .as_deref()
+                        .is_some_and(|l| l.to_lowercase().contains(&needle))
+            });
+        }
         if want_turtle {
             return Ok(Representation::new(
                 ReprType::new("text/turtle").with_param("charset", "utf-8"),
                 format_turtle(&events).into_bytes(),
             ));
         }
+        let label = match inv.inline_str("q") {
+            Ok(q) => format!("{label} · matching \"{q}\""),
+            Err(_) => label,
+        };
         let body = if detail {
             format_detail(&label, &events)
         } else {
@@ -399,6 +426,14 @@ pub fn calendar() -> FnEndpoint {
             .input(
                 ArgSpec::new("all_day")
                     .summary("Sink: true for an all-day event")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("q")
+                    .summary(
+                        "search: case-insensitive match over title + location \
+                         (requires read:detail — searching titles is reading them)",
+                    )
                     .optional(),
             )
             .input(
@@ -943,6 +978,35 @@ mod tests {
         let (_, was_date) = parse_when("2026-07-11", "start").unwrap();
         assert!(was_date);
         assert!(parse_when("teatime", "start").is_err());
+    }
+
+    #[test]
+    fn search_requires_the_detail_capability() {
+        // q= probes titles: a freebusy holder must be denied BEFORE any
+        // platform call (else q= is a title oracle).
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let freebusy =
+            Capability::root().attenuate(["urn:cap:personal:calendar:read:freebusy".to_string()]);
+        let denied = block_on(
+            kernel.issue(
+                Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:personal:calendar:year").unwrap(),
+                )
+                .with_arg("q", ikigai_core::ArgRef::Inline(b"oncologist".to_vec())),
+                &freebusy,
+            ),
+        );
+        let msg = format!("{:?}", denied.unwrap_err());
+        assert!(msg.contains("read:detail"), "{msg}");
+    }
+
+    #[test]
+    fn the_year_period_spans_the_calendar_year() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        let (start, end, label) = period_range("year", today).unwrap();
+        assert_eq!(label, "2026");
+        assert_eq!(end - start, 365 * 86_400); // 2026 is not a leap year
     }
 
     #[test]
