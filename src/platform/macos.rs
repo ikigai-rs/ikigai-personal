@@ -20,27 +20,6 @@ pub fn contacts() -> Option<String> {
     ))
 }
 
-pub fn calendar() -> Option<String> {
-    Some(format!(
-        "personal calendar — detailed {SAMPLE_NOTE}\n\n  \
-         09:00-09:30  Standup (3 attendees)\n  \
-         11:00-12:00  Design review: resolution fabric\n  \
-         14:00-15:00  1:1 with Grace\n  \
-         18:30-19:30  Dinner — Ada\n"
-    ))
-}
-
-pub fn availability() -> Option<String> {
-    // The free/busy PROJECTION: busy blocks only, no titles or attendees.
-    Some(format!(
-        "availability — free/busy {SAMPLE_NOTE}\n\n  \
-         09:00-09:30  busy\n  \
-         11:00-12:00  busy\n  \
-         14:00-15:00  busy\n  \
-         18:30-19:30  busy\n"
-    ))
-}
-
 // ---- real EventKit: calendar enumeration + creation --------------------------
 
 use block2::RcBlock;
@@ -163,4 +142,90 @@ fn create_calendar_impl(name: &str, account: Option<&str>) -> Result<String, Str
             .map_err(|e| format!("saving calendar failed: {e}"))?;
     }
     Ok(format!("created calendar \"{name}\" on {account_title}"))
+}
+
+/// The events in `[start_epoch, end_epoch)` (unix seconds), optionally filtered
+/// to one calendar by title, sorted by start. Real EventKit.
+pub fn events(
+    start_epoch: i64,
+    end_epoch: i64,
+    calendar: Option<&str>,
+) -> Option<Result<Vec<super::EventInfo>, String>> {
+    Some(events_impl(start_epoch, end_epoch, calendar))
+}
+
+fn rfc3339_local(epoch: f64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(epoch as i64, 0)
+        .single()
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| epoch.to_string())
+}
+
+fn events_impl(
+    start_epoch: i64,
+    end_epoch: i64,
+    calendar: Option<&str>,
+) -> Result<Vec<super::EventInfo>, String> {
+    use objc2_foundation::{NSArray, NSDate};
+
+    let store = store()?;
+    let start = NSDate::dateWithTimeIntervalSince1970(start_epoch as f64);
+    let end = NSDate::dateWithTimeIntervalSince1970(end_epoch as f64);
+
+    // The calendar filter: nil = all event calendars.
+    let filtered: Option<Retained<NSArray<EKCalendar>>> = match calendar {
+        Some(wanted) => {
+            let all = unsafe { store.calendarsForEntityType(EKEntityType::Event) };
+            let mut keep = Vec::new();
+            for i in 0..all.count() {
+                let cal = all.objectAtIndex(i);
+                if unsafe { cal.title() }
+                    .to_string()
+                    .eq_ignore_ascii_case(wanted)
+                {
+                    keep.push(cal);
+                }
+            }
+            if keep.is_empty() {
+                return Err(format!(
+                    "no calendar named \"{wanted}\" — see urn:personal:calendars"
+                ));
+            }
+            Some(NSArray::from_retained_slice(&keep))
+        }
+        None => None,
+    };
+
+    let predicate = unsafe {
+        store.predicateForEventsWithStartDate_endDate_calendars(&start, &end, filtered.as_deref())
+    };
+    let found = unsafe { store.eventsMatchingPredicate(&predicate) };
+
+    let mut out = Vec::new();
+    for i in 0..found.count() {
+        let event = found.objectAtIndex(i);
+        let uid = unsafe { event.calendarItemExternalIdentifier() }
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| unsafe { event.calendarItemIdentifier() }.to_string());
+        let title = unsafe { event.title() }.to_string();
+        let calendar = unsafe { event.calendar() }
+            .map(|c| unsafe { c.title() }.to_string())
+            .unwrap_or_else(|| "(no calendar)".to_string());
+        let start = rfc3339_local(unsafe { event.startDate().timeIntervalSince1970() });
+        let end = rfc3339_local(unsafe { event.endDate().timeIntervalSince1970() });
+        let location = unsafe { event.location() }.map(|s| s.to_string());
+        out.push(super::EventInfo {
+            uid,
+            title,
+            calendar,
+            start,
+            end,
+            all_day: unsafe { event.isAllDay() },
+            location,
+        });
+    }
+    out.sort_by(|a, b| a.start.cmp(&b.start));
+    Ok(out)
 }

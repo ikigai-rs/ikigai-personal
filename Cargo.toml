@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-personal"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Personal contexts for ikigai — OS-backed resources (contacts, calendar, availability) under urn:personal:*. macOS-first; Windows and Linux build but report unsupported for now."
@@ -15,6 +15,9 @@ categories = ["os"]
 ikigai-core = "0.1.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Local-time period math (today/week/month partitions). Clock only — no parsing
+# or serde surface.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Real EventKit access, macOS only — the other platforms keep their clear
 # "not supported yet" answer without pulling Apple frameworks.
@@ -24,6 +27,7 @@ objc2-foundation = "0.3"
 block2 = "0.6"
 objc2-event-kit = { version = "0.3", features = [
     "EKEventStore",
+    "EKEvent",
     "EKCalendar",
     "EKCalendarItem",
     "EKSource",
