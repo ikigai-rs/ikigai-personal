@@ -173,6 +173,21 @@ fn local_midnight(date: NaiveDate) -> i64 {
         .unwrap_or_default()
 }
 
+/// An event boundary from an argument: RFC 3339, or a bare date (= local
+/// midnight). Returns (epoch, was_date_only).
+fn parse_when(value: &str, name: &str) -> Result<(i64, bool)> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok((t.timestamp(), false));
+    }
+    if let Ok(d) = value.parse::<NaiveDate>() {
+        return Ok((local_midnight(d), true));
+    }
+    Err(Error::InvalidArgument {
+        name: name.to_string(),
+        detail: "expected RFC 3339 (2026-07-11T19:00:00-07:00) or YYYY-MM-DD".to_string(),
+    })
+}
+
 /// `HH:MM` from an RFC 3339 local timestamp (the formatting faces are compact).
 fn hhmm(rfc3339: &str) -> &str {
     rfc3339
@@ -287,6 +302,11 @@ fn events_for(inv: &Invocation<'_>) -> Result<Option<(String, Vec<EventInfo>)>> 
 /// free/busy with `…:read:freebusy`, denied with neither.
 pub fn calendar() -> FnEndpoint {
     FnEndpoint::new("calendar", |inv: &Invocation<'_>| {
+        match inv.request.verb {
+            Verb::Sink => return create_event(inv),
+            Verb::Delete => return delete_event(inv),
+            _ => {}
+        }
         let detail = inv
             .capability
             .allows(&read_scope("urn:personal:calendar", Some("detail")));
@@ -338,6 +358,8 @@ pub fn calendar() -> FnEndpoint {
                  `…:read:freebusy`.",
             )
             .verb(Verb::Source)
+            .verb(Verb::Sink)
+            .verb(Verb::Delete)
             .verb(Verb::Meta)
             .input(
                 ArgSpec::new("period")
@@ -346,7 +368,37 @@ pub fn calendar() -> FnEndpoint {
             )
             .input(
                 ArgSpec::new("calendar")
-                    .summary("restrict to one named calendar")
+                    .summary("Source: restrict to one calendar · Sink/Delete: the REQUIRED target")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("title")
+                    .summary("Sink: the event title")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("start")
+                    .summary("Sink: RFC 3339 or YYYY-MM-DD (all-day) · Delete: window hint")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("end")
+                    .summary("Sink: RFC 3339 (default: +1h, or all-day for a date start)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("location")
+                    .summary("Sink: the event location")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("uid")
+                    .summary("Sink: source identity (urn:event:{uid} on the event's URL) · Delete: REQUIRED")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("all_day")
+                    .summary("Sink: true for an all-day event")
                     .optional(),
             )
             .input(
@@ -355,6 +407,85 @@ pub fn calendar() -> FnEndpoint {
                     .optional(),
             )
             .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// `Sink urn:personal:calendar` — create an event in a NAMED calendar (the
+/// materialized-view apply path). Args are validated before any platform call.
+fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
+    let scope = "urn:cap:personal:calendar:write";
+    if !inv.capability.allows(scope) {
+        return Err(denied("calendar", scope));
+    }
+    let calendar = inv.inline_str("calendar").map_err(|_| {
+        Error::MissingArgument(
+            "calendar (writes always address a named calendar, e.g. calendar=Brian-Busy)"
+                .to_string(),
+        )
+    })?;
+    // title= or the trailing content — the engine's sink grammar is
+    // "leading k=v args, the rest is content", and a multi-word title IS the
+    // natural content of an event write.
+    let title = inv
+        .inline_str("title")
+        .or_else(|_| inv.inline_str("content"))
+        .ok()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| Error::MissingArgument("title (or write it as the content)".to_string()))?;
+    let (start, start_was_date) = parse_when(inv.inline_str("start")?, "start")?;
+    let (end, _) = match inv.inline_str("end") {
+        Ok(end) => parse_when(end, "end")?,
+        // date-only start -> all-day (ends next midnight); timed -> one hour
+        Err(_) if start_was_date => (start + 86_400, true),
+        Err(_) => (start + 3_600, false),
+    };
+    let all_day = start_was_date
+        || inv
+            .inline_str("all_day")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+    let location = inv.inline_str("location").ok();
+    let uid = inv.inline_str("uid").ok();
+    resolve(
+        "calendar",
+        flatten(platform::create_event(
+            calendar, title, start, end, all_day, location, uid,
+        ))?,
+    )
+}
+
+/// `Delete urn:personal:calendar` — remove the event with `uid=` from a NAMED
+/// calendar. `start=` (when known — the diff's removed triples carry dtstart)
+/// narrows the search window; else a wide one is scanned.
+fn delete_event(inv: &Invocation<'_>) -> Result<Representation> {
+    let scope = "urn:cap:personal:calendar:write";
+    if !inv.capability.allows(scope) {
+        return Err(denied("calendar", scope));
+    }
+    let calendar = inv.inline_str("calendar").map_err(|_| {
+        Error::MissingArgument("calendar (deletes always address a named calendar)".to_string())
+    })?;
+    let uid = inv
+        .inline_str("uid")
+        .map_err(|_| Error::MissingArgument("uid".to_string()))?;
+    let (window_start, window_end) =
+        match inv.inline_str("start").ok().map(|s| parse_when(s, "start")) {
+            Some(Ok((hint, _))) => (hint - 86_400, hint + 2 * 86_400),
+            Some(Err(e)) => return Err(e),
+            None => {
+                let now = Local::now().timestamp();
+                (now - 366 * 86_400, now + 2 * 366 * 86_400)
+            }
+        };
+    resolve(
+        "calendar",
+        flatten(platform::delete_event(
+            calendar,
+            uid,
+            window_start,
+            window_end,
+        ))?,
     )
 }
 
@@ -771,6 +902,47 @@ mod tests {
         );
         let msg = format!("{:?}", denied.unwrap_err());
         assert!(msg.contains("read:detail"), "{msg}");
+    }
+
+    #[test]
+    fn writes_require_the_write_capability_and_a_named_calendar() {
+        let kernel = Kernel::new(Arc::new(space(None)));
+        // read caps can't write
+        let read_only =
+            Capability::root().attenuate(["urn:cap:personal:calendar:read:detail".to_string()]);
+        let denied = block_on(kernel.issue(
+            Request::new(Verb::Sink, Iri::parse("urn:personal:calendar").unwrap()),
+            &read_only,
+        ));
+        assert!(format!("{:?}", denied.unwrap_err()).contains("not authorized"));
+        // root without calendar= fails BEFORE any platform call
+        let missing = block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:personal:calendar").unwrap())
+                    .with_arg("title", ikigai_core::ArgRef::Inline(b"X".to_vec())),
+                &Capability::root(),
+            ),
+        );
+        assert!(format!("{:?}", missing.unwrap_err()).contains("calendar"));
+        // delete needs uid
+        let missing_uid = block_on(
+            kernel.issue(
+                Request::new(Verb::Delete, Iri::parse("urn:personal:calendar").unwrap())
+                    .with_arg("calendar", ikigai_core::ArgRef::Inline(b"X".to_vec())),
+                &Capability::root(),
+            ),
+        );
+        assert!(format!("{:?}", missing_uid.unwrap_err()).contains("uid"));
+    }
+
+    #[test]
+    fn event_boundaries_parse_rfc3339_and_dates() {
+        let (t, was_date) = parse_when("2026-07-11T19:00:00-07:00", "start").unwrap();
+        assert!(!was_date);
+        assert!(t > 1_700_000_000);
+        let (_, was_date) = parse_when("2026-07-11", "start").unwrap();
+        assert!(was_date);
+        assert!(parse_when("teatime", "start").is_err());
     }
 
     #[test]
