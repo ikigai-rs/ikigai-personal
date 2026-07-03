@@ -410,7 +410,7 @@ pub fn observe_store(on_change: Box<dyn Fn() + Send>) -> Option<()> {
         use objc2_foundation::{NSNotificationCenter, NSOperationQueue, NSRunLoop};
 
         let Ok(store) = store() else { return };
-        let queue = unsafe { NSOperationQueue::new() };
+        let queue = NSOperationQueue::new();
         let block = block2::RcBlock::new(
             move |_notification: core::ptr::NonNull<objc2_foundation::NSNotification>| {
                 on_change();
@@ -429,7 +429,7 @@ pub fn observe_store(on_change: Box<dyn Fn() + Send>) -> Option<()> {
         std::mem::forget(store);
         std::mem::forget(queue);
         // Service this thread's runloop so the framework's sources deliver.
-        unsafe { NSRunLoop::currentRunLoop().run() };
+        NSRunLoop::currentRunLoop().run();
     });
     Some(())
 }
