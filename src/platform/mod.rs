@@ -50,6 +50,9 @@ pub struct EventInfo {
 /// store UID across occurrences, so each occurrence is qualified by its start
 /// date — otherwise every occurrence collapses onto one graph subject (an
 /// "event" with several dtstarts). Mirrors the org side's `…-YYYY-MM-DD`.
+// Only the macOS backend calls this today; other platforms' event backends
+// will when they land.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn occurrence_uid(store_uid: &str, recurring: bool, start_rfc3339: &str) -> String {
     if recurring {
         let date = start_rfc3339.split('T').next().unwrap_or(start_rfc3339);
