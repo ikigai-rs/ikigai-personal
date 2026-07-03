@@ -26,9 +26,12 @@
 mod platform;
 
 use ikigai_core::{
-    Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType, Representation,
-    Result, Verb,
+    ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
+    Representation, Result, Verb,
 };
+use serde::Deserialize;
+
+pub use platform::CalendarInfo;
 
 fn text_plain_utf8() -> ReprType {
     ReprType::new("text/plain").with_param("charset", "utf-8")
@@ -143,12 +146,184 @@ pub fn availability() -> FnEndpoint {
     )
 }
 
-/// The personal-contexts space: binds the resources at `urn:personal:*`.
-pub fn space() -> EndpointSpace {
+/// Configuration for the consolidated-view calendar machinery — the
+/// hand-editable file a host loads (conventionally
+/// `~/.config/ikigai/calendar.json`).
+///
+/// ```json
+/// { "view": "Brian-Busy",
+///   "account": "iCloud",
+///   "sources": ["Brian", "Bosatsu"],
+///   "inbox": "Brian-New" }
+/// ```
+#[derive(Clone, Debug, Deserialize)]
+pub struct CalendarConfig {
+    /// The derived, sync-owned view calendar the household subscribes to
+    /// (e.g. "Brian-Busy"). Never a source; regenerable.
+    pub view: String,
+    /// Native calendars unioned into the view — an explicit allowlist, never
+    /// "all calendars" (the view itself and the inbox live in the same store).
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// The phone-capture inbox calendar, drained into org (e.g. "Brian-New").
+    #[serde(default)]
+    pub inbox: Option<String>,
+    /// The account (EventKit source) to create calendars on, e.g. "iCloud".
+    /// Absent: prefer an iCloud source, else the system default.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+impl CalendarConfig {
+    /// Parse the hand-editable JSON config.
+    pub fn from_json(json: &str) -> Result<Self> {
+        serde_json::from_str(json).map_err(|e| {
+            Error::Endpoint(format!("urn:personal:calendar:config: invalid JSON: {e}"))
+        })
+    }
+}
+
+/// `calendars`: the native calendar collection. `Source` lists every calendar
+/// with its account; `Sink` creates one — `name=` (default: the configured
+/// view) on `account=` (default: configured account, else iCloud, else the
+/// system default). Real EventKit; the first use may raise the macOS
+/// calendar-access prompt.
+pub fn calendars(config: Option<CalendarConfig>) -> FnEndpoint {
+    FnEndpoint::new("calendars", move |inv: &Invocation<'_>| {
+        match inv.request.verb {
+            Verb::Sink => {
+                let scope = "urn:cap:personal:calendar:write";
+                if !inv.capability.allows(scope) {
+                    return Err(denied("calendars", scope));
+                }
+                let name = inv
+                    .inline_str("name")
+                    .map(str::to_string)
+                    .ok()
+                    .or_else(|| config.as_ref().map(|c| c.view.clone()))
+                    .ok_or_else(|| {
+                        Error::Endpoint(
+                            "urn:personal:calendars: no name= given and no view configured \
+                             (see urn:personal:calendar:config)"
+                                .to_string(),
+                        )
+                    })?;
+                let account = inv
+                    .inline_str("account")
+                    .map(str::to_string)
+                    .ok()
+                    .or_else(|| config.as_ref().and_then(|c| c.account.clone()));
+                let made = platform::create_calendar(&name, account.as_deref());
+                resolve("calendars", flatten(made)?)
+            }
+            _ => {
+                let scope = read_scope("urn:personal:calendar", Some("detail"));
+                if !inv.capability.allows(&scope) {
+                    return Err(denied("calendars", &scope));
+                }
+                let listed = flatten(platform::calendars().map(|r| {
+                    r.map(|calendars| {
+                        calendars
+                            .iter()
+                            .map(|c| format!("{}  [{}]", c.title, c.account))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                }))?;
+                resolve("calendars", listed)
+            }
+        }
+    })
+    .with_description(
+        Description::new("calendars")
+            .title("Calendars")
+            .summary(
+                "The native calendar collection. Source lists every calendar with its \
+                 account; Sink creates one (name= — default the configured view — on \
+                 account=, default iCloud). Real EventKit; first use may prompt for \
+                 calendar access.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Sink)
+            .verb(Verb::Meta)
+            .input(
+                ArgSpec::new("name")
+                    .summary("Sink: the calendar to create (default: the configured view)")
+                    .optional(),
+            )
+            .input(
+                ArgSpec::new("account")
+                    .summary("Sink: the account to create it on (default: configured, else iCloud)")
+                    .optional(),
+            )
+            .output("text/plain;charset=utf-8"),
+    )
+}
+
+/// Unwrap the platform Option (None = unsupported OS) and the backend Result
+/// (Err = a real failure, e.g. TCC denied) into the endpoint's shape.
+fn flatten(outcome: Option<std::result::Result<String, String>>) -> Result<Option<String>> {
+    match outcome {
+        None => Ok(None),
+        Some(Ok(body)) => Ok(Some(body)),
+        Some(Err(why)) => Err(Error::Endpoint(why)),
+    }
+}
+
+/// `calendar:config`: the effective consolidated-view configuration the host
+/// loaded (view name, source allowlist, inbox, account) — or a pointer to
+/// create the file if none was found.
+pub fn calendar_config(config: Option<CalendarConfig>) -> FnEndpoint {
+    FnEndpoint::new("calendar-config", move |_inv: &Invocation<'_>| {
+        let Some(config) = &config else {
+            return Err(Error::Endpoint(
+                "no calendar config loaded — create ~/.config/ikigai/calendar.json \
+                 with { \"view\": …, \"sources\": [...], \"inbox\": …, \"account\": … }"
+                    .to_string(),
+            ));
+        };
+        let body = serde_json::json!({
+            "view": config.view,
+            "sources": config.sources,
+            "inbox": config.inbox,
+            "account": config.account,
+        });
+        Ok(Representation::new(
+            ReprType::new("application/json").with_param("charset", "utf-8"),
+            serde_json::to_vec(&body).unwrap_or_default(),
+        )
+        .cacheable())
+    })
+    .with_description(
+        Description::new("calendar-config")
+            .title("Calendar view config")
+            .summary(
+                "The effective consolidated-view configuration: the view calendar's name, \
+                 the source allowlist, the capture inbox, and the account.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .output("application/json"),
+    )
+}
+
+/// The personal-contexts space: binds the resources at `urn:personal:*`. The
+/// optional [`CalendarConfig`] (host-loaded, conventionally
+/// `~/.config/ikigai/calendar.json`) parameterizes the consolidated-view
+/// machinery; `None` leaves the read resources fully functional.
+pub fn space(config: Option<CalendarConfig>) -> EndpointSpace {
     EndpointSpace::new()
         .bind(Exact::new("urn:personal:contacts"), contacts())
         .bind(Exact::new("urn:personal:calendar"), calendar())
         .bind(Exact::new("urn:personal:availability"), availability())
+        .bind(
+            Exact::new("urn:personal:calendars"),
+            calendars(config.clone()),
+        )
+        .bind(
+            Exact::new("urn:personal:calendar:config"),
+            calendar_config(config),
+        )
 }
 
 /// Whether a personal backend is implemented for the platform this was built for.
@@ -169,7 +344,7 @@ mod tests {
     use std::sync::Arc;
 
     fn source(iri: &str, capability: &Capability) -> Result<Representation> {
-        let kernel = Kernel::new(Arc::new(space()));
+        let kernel = Kernel::new(Arc::new(space(None)));
         block_on(kernel.issue(
             Request::new(Verb::Source, Iri::parse(iri).unwrap()),
             capability,
@@ -181,6 +356,77 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn text(iri: &str, capability: &Capability) -> String {
         String::from_utf8(source(iri, capability).unwrap().bytes).unwrap()
+    }
+
+    #[test]
+    fn calendar_config_parses() {
+        let config = CalendarConfig::from_json(
+            r#"{ "view": "Brian-Busy", "account": "iCloud",
+                 "sources": ["Brian", "Bosatsu"], "inbox": "Brian-New" }"#,
+        )
+        .unwrap();
+        assert_eq!(config.view, "Brian-Busy");
+        assert_eq!(config.sources, ["Brian", "Bosatsu"]);
+        assert_eq!(config.inbox.as_deref(), Some("Brian-New"));
+        assert_eq!(config.account.as_deref(), Some("iCloud"));
+        // Only the view is required.
+        let minimal = CalendarConfig::from_json(r#"{ "view": "V" }"#).unwrap();
+        assert!(minimal.sources.is_empty());
+    }
+
+    #[test]
+    fn creating_a_calendar_requires_the_write_capability() {
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let read_only =
+            Capability::root().attenuate(["urn:cap:personal:calendar:read:detail".to_string()]);
+        let denied = block_on(
+            kernel.issue(
+                Request::new(Verb::Sink, Iri::parse("urn:personal:calendars").unwrap())
+                    .with_arg("name", ikigai_core::ArgRef::Inline(b"X".to_vec())),
+                &read_only,
+            ),
+        );
+        let msg = format!("{:?}", denied.unwrap_err());
+        assert!(msg.contains("not authorized"), "{msg}");
+    }
+
+    #[test]
+    fn listing_calendars_requires_detail_read() {
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let freebusy =
+            Capability::root().attenuate(["urn:cap:personal:calendar:read:freebusy".to_string()]);
+        let denied = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:personal:calendars").unwrap()),
+            &freebusy,
+        ));
+        assert!(denied.is_err(), "calendar names are detail, not freebusy");
+    }
+
+    #[test]
+    fn the_config_resource_reports_or_guides() {
+        let kernel = Kernel::new(Arc::new(space(Some(
+            CalendarConfig::from_json(r#"{ "view": "Brian-Busy", "sources": ["Brian"] }"#).unwrap(),
+        ))));
+        let out = block_on(kernel.issue(
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:personal:calendar:config").unwrap(),
+            ),
+            &Capability::root(),
+        ))
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["view"], "Brian-Busy");
+
+        let bare = Kernel::new(Arc::new(space(None)));
+        let err = block_on(bare.issue(
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:personal:calendar:config").unwrap(),
+            ),
+            &Capability::root(),
+        ));
+        assert!(format!("{:?}", err.unwrap_err()).contains(".config/ikigai/calendar.json"));
     }
 
     #[test]
