@@ -206,6 +206,13 @@ fn events_impl(
     let mut out = Vec::new();
     for i in 0..found.count() {
         let event = found.objectAtIndex(i);
+        // Identity round-trip: events this system CREATED carry their source
+        // identity (urn:event:{uid}) in the URL field — prefer it, so a written
+        // event reads back as the same graph subject and diffs converge.
+        let url_uid = unsafe { event.URL() }
+            .and_then(|u| u.absoluteString())
+            .map(|s| s.to_string())
+            .and_then(|u| u.strip_prefix("urn:event:").map(str::to_string));
         let store_uid = unsafe { event.calendarItemExternalIdentifier() }
             .map(|s| s.to_string())
             .unwrap_or_else(|| unsafe { event.calendarItemIdentifier() }.to_string());
@@ -217,7 +224,9 @@ fn events_impl(
         let end = rfc3339_local(unsafe { event.endDate().timeIntervalSince1970() });
         // One EKEvent per OCCURRENCE, but occurrences of a recurring event share
         // the store UID — qualify by date so each occurrence is its own subject.
-        let uid = super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start);
+        let uid = url_uid.unwrap_or_else(|| {
+            super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start)
+        });
         let location = unsafe { event.location() }.map(|s| s.to_string());
         out.push(super::EventInfo {
             uid,
@@ -231,4 +240,143 @@ fn events_impl(
     }
     out.sort_by(|a, b| a.start.cmp(&b.start));
     Ok(out)
+}
+
+/// Find one calendar by title (writes address a NAMED calendar, always).
+fn calendar_named(store: &EKEventStore, title: &str) -> Result<Retained<EKCalendar>, String> {
+    let all = unsafe { store.calendarsForEntityType(EKEntityType::Event) };
+    for i in 0..all.count() {
+        let cal = all.objectAtIndex(i);
+        if unsafe { cal.title() }
+            .to_string()
+            .eq_ignore_ascii_case(title)
+        {
+            return Ok(cal);
+        }
+    }
+    Err(format!(
+        "no calendar named \"{title}\" — see urn:personal:calendars"
+    ))
+}
+
+/// Create an event in a named calendar. `source_uid` (when given) is written to
+/// the event's URL as `urn:event:{uid}` — the identity round-trip that lets a
+/// later read recognize the event as the same graph subject.
+#[allow(clippy::too_many_arguments)]
+pub fn create_event(
+    calendar: &str,
+    title: &str,
+    start_epoch: i64,
+    end_epoch: i64,
+    all_day: bool,
+    location: Option<&str>,
+    source_uid: Option<&str>,
+) -> Option<Result<String, String>> {
+    Some(create_event_impl(
+        calendar,
+        title,
+        start_epoch,
+        end_epoch,
+        all_day,
+        location,
+        source_uid,
+    ))
+}
+
+fn create_event_impl(
+    calendar: &str,
+    title: &str,
+    start_epoch: i64,
+    end_epoch: i64,
+    all_day: bool,
+    location: Option<&str>,
+    source_uid: Option<&str>,
+) -> Result<String, String> {
+    use objc2_event_kit::{EKEvent, EKSpan};
+    use objc2_foundation::{NSDate, NSURL};
+
+    let store = store()?;
+    let target = calendar_named(&store, calendar)?;
+    let event = unsafe { EKEvent::eventWithEventStore(&store) };
+    unsafe {
+        event.setTitle(Some(&NSString::from_str(title)));
+        event.setStartDate(Some(&NSDate::dateWithTimeIntervalSince1970(
+            start_epoch as f64,
+        )));
+        event.setEndDate(Some(&NSDate::dateWithTimeIntervalSince1970(
+            end_epoch as f64,
+        )));
+        event.setAllDay(all_day);
+        if let Some(location) = location {
+            event.setLocation(Some(&NSString::from_str(location)));
+        }
+        if let Some(uid) = source_uid {
+            let url = NSURL::URLWithString(&NSString::from_str(&format!("urn:event:{uid}")));
+            event.setURL(url.as_deref());
+        }
+        event.setCalendar(Some(&target));
+        store
+            .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+            .map_err(|e| format!("saving event failed: {e}"))?;
+    }
+    Ok(format!("created \"{title}\" in {calendar}"))
+}
+
+/// Delete the event with `uid` (URL-carried source identity, or the
+/// occurrence-qualified store uid) from a named calendar, searching
+/// `[window_start, window_end)`.
+pub fn delete_event(
+    calendar: &str,
+    uid: &str,
+    window_start: i64,
+    window_end: i64,
+) -> Option<Result<String, String>> {
+    Some(delete_event_impl(calendar, uid, window_start, window_end))
+}
+
+fn delete_event_impl(
+    calendar: &str,
+    uid: &str,
+    window_start: i64,
+    window_end: i64,
+) -> Result<String, String> {
+    use objc2_event_kit::EKSpan;
+    use objc2_foundation::{NSArray, NSDate};
+
+    let store = store()?;
+    let target = calendar_named(&store, calendar)?;
+    let cals = NSArray::from_retained_slice(&[target]);
+    let predicate = unsafe {
+        store.predicateForEventsWithStartDate_endDate_calendars(
+            &NSDate::dateWithTimeIntervalSince1970(window_start as f64),
+            &NSDate::dateWithTimeIntervalSince1970(window_end as f64),
+            Some(&cals),
+        )
+    };
+    let found = unsafe { store.eventsMatchingPredicate(&predicate) };
+    for i in 0..found.count() {
+        let event = found.objectAtIndex(i);
+        let url_uid = unsafe { event.URL() }
+            .and_then(|u| u.absoluteString())
+            .map(|s| s.to_string())
+            .and_then(|u| u.strip_prefix("urn:event:").map(str::to_string));
+        let store_uid = unsafe { event.calendarItemExternalIdentifier() }
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| unsafe { event.calendarItemIdentifier() }.to_string());
+        let start = rfc3339_local(unsafe { event.startDate().timeIntervalSince1970() });
+        let occurrence =
+            super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start);
+        if url_uid.as_deref() == Some(uid) || occurrence == uid {
+            let title = unsafe { event.title() }.to_string();
+            unsafe {
+                store
+                    .removeEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                    .map_err(|e| format!("removing event failed: {e}"))?;
+            }
+            return Ok(format!("removed \"{title}\" from {calendar}"));
+        }
+    }
+    Err(format!(
+        "no event with uid {uid} in {calendar} within the window"
+    ))
 }

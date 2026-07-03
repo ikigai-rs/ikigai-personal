@@ -15,7 +15,9 @@
 )]
 mod imp;
 
-pub use imp::{calendars, contacts, create_calendar, events, NAME, SUPPORTED};
+pub use imp::{
+    calendars, contacts, create_calendar, create_event, delete_event, events, NAME, SUPPORTED,
+};
 
 /// One native calendar, as the OS reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
