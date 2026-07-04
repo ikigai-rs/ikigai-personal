@@ -407,7 +407,9 @@ fn delete_event_impl(
 /// reactions event-driven instead of polled.
 pub fn observe_store(on_change: Box<dyn Fn() + Send>) -> Option<()> {
     std::thread::spawn(move || {
-        use objc2_foundation::{NSNotificationCenter, NSOperationQueue, NSRunLoop};
+        use objc2_foundation::{
+            NSDefaultRunLoopMode, NSNotificationCenter, NSOperationQueue, NSPort, NSRunLoop,
+        };
 
         let Ok(store) = store() else { return };
         let queue = NSOperationQueue::new();
@@ -416,10 +418,12 @@ pub fn observe_store(on_change: Box<dyn Fn() + Send>) -> Option<()> {
                 on_change();
             },
         );
+        // object: None — observe the notification regardless of WHICH store
+        // instance posts it (this process holds thread-local stores).
         let token = unsafe {
             NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
                 Some(objc2_event_kit::EKEventStoreChangedNotification),
-                Some(&store),
+                None,
                 Some(&queue),
                 &block,
             )
@@ -428,8 +432,13 @@ pub fn observe_store(on_change: Box<dyn Fn() + Send>) -> Option<()> {
         std::mem::forget(token);
         std::mem::forget(store);
         std::mem::forget(queue);
-        // Service this thread's runloop so the framework's sources deliver.
-        NSRunLoop::currentRunLoop().run();
+        eprintln!("ikigai: calendar observer active");
+        // A runloop with NO sources exits `run()` immediately — attach a dummy
+        // Mach port so the loop blocks and services the framework's delivery.
+        let runloop = NSRunLoop::currentRunLoop();
+        unsafe { runloop.addPort_forMode(&NSPort::port(), NSDefaultRunLoopMode) };
+        runloop.run();
+        eprintln!("ikigai: calendar observer runloop exited (unexpected)");
     });
     Some(())
 }
