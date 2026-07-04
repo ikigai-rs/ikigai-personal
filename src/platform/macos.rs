@@ -246,6 +246,7 @@ fn events_impl(
             super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start)
         });
         let location = unsafe { event.location() }.map(|s| s.to_string());
+        let alerts = read_alerts(&event);
         out.push(super::EventInfo {
             uid,
             title,
@@ -254,10 +255,28 @@ fn events_impl(
             end,
             all_day: unsafe { event.isAllDay() },
             location,
+            alerts,
         });
     }
     out.sort_by(|a, b| a.start.cmp(&b.start));
     Ok(out)
+}
+
+/// The event's relative alarms as minutes-before-start, sorted (absolute-date
+/// alarms are skipped — the graph speaks offsets).
+fn read_alerts(event: &objc2_event_kit::EKEvent) -> Vec<u32> {
+    let Some(alarms) = (unsafe { event.alarms() }) else {
+        return Vec::new();
+    };
+    let mut minutes: Vec<u32> = (0..alarms.count())
+        .map(|i| alarms.objectAtIndex(i))
+        .map(|alarm| unsafe { alarm.relativeOffset() })
+        .filter(|offset| *offset < 0.0)
+        .map(|offset| (-offset / 60.0).round() as u32)
+        .collect();
+    minutes.sort_unstable();
+    minutes.dedup();
+    minutes
 }
 
 /// Find one calendar by title (writes address a NAMED calendar, always).
@@ -289,6 +308,7 @@ pub fn create_event(
     all_day: bool,
     location: Option<&str>,
     source_uid: Option<&str>,
+    alerts: &[u32],
 ) -> Option<Result<String, String>> {
     Some(create_event_impl(
         calendar,
@@ -298,9 +318,11 @@ pub fn create_event(
         all_day,
         location,
         source_uid,
+        alerts,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_event_impl(
     calendar: &str,
     title: &str,
@@ -309,8 +331,9 @@ fn create_event_impl(
     all_day: bool,
     location: Option<&str>,
     source_uid: Option<&str>,
+    alerts: &[u32],
 ) -> Result<String, String> {
-    use objc2_event_kit::{EKEvent, EKSpan};
+    use objc2_event_kit::{EKAlarm, EKEvent, EKSpan};
     use objc2_foundation::{NSDate, NSURL};
 
     let store = store()?;
@@ -331,6 +354,10 @@ fn create_event_impl(
         if let Some(uid) = source_uid {
             let url = NSURL::URLWithString(&NSString::from_str(&format!("urn:event:{uid}")));
             event.setURL(url.as_deref());
+        }
+        for minutes in alerts {
+            let alarm = EKAlarm::alarmWithRelativeOffset(-(f64::from(*minutes) * 60.0));
+            event.addAlarm(&alarm);
         }
         event.setCalendar(Some(&target));
         store

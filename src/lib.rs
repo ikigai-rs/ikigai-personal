@@ -202,6 +202,32 @@ fn parse_when(value: &str, name: &str) -> Result<(i64, bool)> {
     })
 }
 
+/// `alert=` values: space/comma-separated friendly durations (`30m`, `1h`,
+/// `1d`, or bare minutes) — minutes before start, sorted and deduplicated.
+fn parse_alert_minutes(value: &str) -> Vec<u32> {
+    let mut minutes: Vec<u32> = value
+        .split([' ', ','])
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let (digits, factor) = match part.strip_suffix(['m', 'h', 'd']) {
+                Some(rest) => (
+                    rest,
+                    match part.chars().last() {
+                        Some('h') => 60,
+                        Some('d') => 1440,
+                        _ => 1,
+                    },
+                ),
+                None => (part, 1),
+            };
+            digits.parse::<u32>().ok().map(|n| n * factor)
+        })
+        .collect();
+    minutes.sort_unstable();
+    minutes.dedup();
+    minutes
+}
+
 /// `HH:MM` from an RFC 3339 local timestamp (the formatting faces are compact).
 fn hhmm(rfc3339: &str) -> &str {
     rfc3339
@@ -271,6 +297,9 @@ fn format_turtle(events: &[EventInfo]) -> String {
         ];
         if e.all_day {
             props.push("ik:allDay true".to_string());
+        }
+        for minutes in &e.alerts {
+            props.push(format!("ik:alert {minutes}"));
         }
         if let Some(location) = &e.location {
             props.push(format!("ical:location {}", ttl_str(location)));
@@ -438,6 +467,11 @@ pub fn calendar() -> FnEndpoint {
                     .optional(),
             )
             .input(
+                ArgSpec::new("alert")
+                    .summary("Sink: alarms before start — \"1h 1d\", \"30m\", or bare minutes")
+                    .optional(),
+            )
+            .input(
                 ArgSpec::new("q")
                     .summary(
                         "search: case-insensitive match over title + location \
@@ -491,10 +525,14 @@ fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
             .unwrap_or(false);
     let location = inv.inline_str("location").ok();
     let uid = inv.inline_str("uid").ok();
+    let alerts = inv
+        .inline_str("alert")
+        .map(parse_alert_minutes)
+        .unwrap_or_default();
     resolve(
         "calendar",
         flatten(platform::create_event(
-            calendar, title, start, end, all_day, location, uid,
+            calendar, title, start, end, all_day, location, uid, &alerts,
         ))?,
     )
 }
@@ -880,6 +918,7 @@ mod tests {
                 end: "2026-07-02T12:00:00-07:00".into(),
                 all_day: false,
                 location: Some("Zoom".into()),
+                alerts: vec![60, 1440],
             },
             EventInfo {
                 uid: "DEF 456".into(),
@@ -889,6 +928,7 @@ mod tests {
                 end: "2026-07-02T19:30:00-07:00".into(),
                 all_day: false,
                 location: None,
+                alerts: Vec::new(),
             },
         ]
     }
@@ -936,6 +976,8 @@ mod tests {
         // the quoted title survives escaping
         assert!(ttl.contains("ical:summary \"Dinner — \\\"Ada\\\"\""));
         assert!(ttl.contains("ik:calendar \"Bosatsu\""));
+        assert!(ttl.contains("ik:alert 60"));
+        assert!(ttl.contains("ik:alert 1440"));
         assert!(!ttl.contains("_:"), "no blank nodes — diff must be set ops");
     }
 
@@ -986,6 +1028,13 @@ mod tests {
             ),
         );
         assert!(format!("{:?}", missing_uid.unwrap_err()).contains("uid"));
+    }
+
+    #[test]
+    fn alert_durations_parse() {
+        assert_eq!(parse_alert_minutes("1h 1d"), vec![60, 1440]);
+        assert_eq!(parse_alert_minutes("30m,15"), vec![15, 30]);
+        assert_eq!(parse_alert_minutes("junk"), Vec::<u32>::new());
     }
 
     #[test]
