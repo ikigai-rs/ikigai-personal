@@ -16,17 +16,19 @@ macOS: reads, writes, and calendar management, capability-projected throughout.
 ## Periods, search, and faces
 
 `{period}` is `today` · `tomorrow` · `week` (Monday-start) · `month` · `year` ·
-a month name · `YYYY-MM` · `YYYY-MM-DD`; bare = `week`. `calendar=` restricts to
-one named calendar; `q=` searches case-insensitively over titles and locations.
+a month name · `YYYY-MM` · `YYYY-MM-DD` · a range `YYYY-MM-DD..YYYY-MM-DD`
+(end-inclusive — rolling windows that cross a year boundary are one period);
+bare = `week`. `calendar=` restricts to one named calendar; `q=` searches
+case-insensitively over titles and locations.
 
 Three representations, **projected on the capability**:
 
 - **detail text** — times, titles, calendars, locations (`…:read:detail`)
 - **free/busy text** — busy blocks only (`…:read:freebusy`)
 - **`as=text/turtle`** — the **skolemized event graph**: `urn:event:{uid}`
-  subjects (no blank nodes), iCal RDF vocabulary, `ik:calendar` provenance —
-  so calendars union and diff as ordinary graph set operations. Detail-gated:
-  Turtle carries titles.
+  subjects (no blank nodes), iCal RDF vocabulary, `ik:calendar` provenance,
+  multi-valued `ik:alert` (minutes before start) — so calendars union and diff
+  as ordinary graph set operations. Detail-gated: Turtle carries titles.
 
 The capability wall has teeth: `q=` under a free/busy-only capability is denied
 *before any platform call* — searching titles is reading them, and an attenuated
@@ -42,6 +44,15 @@ a `uid=` which is stamped on the event's URL as `urn:event:{uid}`, and reads
 **prefer** a URL-carried identity — so an event written from another system of
 record reads back as the *same subject*, making derivation passes idempotent
 and duplicate-free.
+
+## Alarms
+
+Writes accept `alert=` — friendly space/comma-separated tokens (`1h 1d`,
+`30m,15`, bare numbers are minutes) — and each token becomes an `EKAlarm` that
+fires that long before the event starts. Reads emit the alarms back as
+multi-valued `ik:alert`, so alarms survive graph diffs: an org entry's
+`:ALERT:` drawer line flows through a derivation pass onto the derived
+calendar, and your phone rings.
 
 ## The consolidated-view configuration
 
@@ -61,7 +72,7 @@ calendar on the configured account.
 
 | platform | status |
 |----------|--------|
-| **macOS** | real EventKit (objc2): list/create calendars, read/search/write/delete events, TCC full-access flow, one reused store per thread |
+| **macOS** | real EventKit (objc2): list/create calendars, read/search/write/delete events, alarms, TCC full-access flow, one reused store per thread, store-change observation API |
 | **Windows / Linux** | placeholders — build cleanly, resolve to a clear "not supported yet" error |
 
 Adding a backend means filling in one file under `src/platform/` — the seam and
@@ -79,7 +90,7 @@ let config = ikigai_personal::CalendarConfig::from_json(&config_json).ok();
 let kernel = Kernel::new(Arc::new(ikigai_personal::space(config)));
 // source urn:personal:calendar:week calendar=Bosatsu
 // source urn:personal:calendar:year q=dentist as=text/turtle
-// sink   urn:personal:calendar calendar=Brian-Busy start=2026-07-11T19:00:00-07:00 uid=… Dinner
+// sink   urn:personal:calendar calendar=Brian-Busy start=2026-07-11T19:00:00-07:00 alert=1h uid=… Dinner
 ```
 
 Personal data is treated as a live fact and is **uncacheable**.
