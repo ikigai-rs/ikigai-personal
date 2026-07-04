@@ -30,3 +30,22 @@ jobs:
 
       - name: clippy (wasm lib)
         run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
+
+  # The real platform face: src/platform/macos.rs (objc2/EventKit) is
+  # cfg-gated OFF the Ubuntu job, so mac-only clippy/test breakage merges
+  # green there — it did, twice. This job compiles what the crate is FOR.
+  # (Tests never touch EventKit — the runner has no TCC grant.)
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy (macOS, all targets)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test (macOS)
+        run: cargo test
