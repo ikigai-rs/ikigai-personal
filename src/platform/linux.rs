@@ -28,6 +28,7 @@ pub fn events(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_event(
     _calendar: &str,
     _title: &str,
@@ -36,6 +37,7 @@ pub fn create_event(
     _all_day: bool,
     _location: Option<&str>,
     _source_uid: Option<&str>,
+    _alerts: &[u32],
 ) -> Option<Result<String, String>> {
     None
 }

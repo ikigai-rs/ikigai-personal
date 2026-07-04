@@ -47,6 +47,8 @@ pub struct EventInfo {
     pub all_day: bool,
     /// The location, when set.
     pub location: Option<String>,
+    /// Alarms: minutes before start (relative alarms only), sorted.
+    pub alerts: Vec<u32>,
 }
 
 /// The skolemization id for one fetched event: recurring events share one
