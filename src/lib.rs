@@ -28,8 +28,8 @@ mod platform;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 use ikigai_core::{
-    ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation, ReprType,
-    Representation, Result, UriTemplate, Verb,
+    ActionSpec, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation,
+    ReprType, Representation, Result, UriTemplate, Verb,
 };
 use serde::Deserialize;
 
@@ -484,7 +484,91 @@ pub fn calendar() -> FnEndpoint {
                     .summary("text/turtle for the skolemized event graph (detail-gated)")
                     .optional(),
             )
-            .output("text/plain;charset=utf-8"),
+            .output("text/plain;charset=utf-8")
+            // The per-verb contracts — the selection truth (the flat list above stays
+            // as the engine's arg-routing surface). Source's floor is read:freebusy
+            // (detail projects MORE onto the same action; requires-semantics is AND,
+            // so the floor is what's listed — the OR of read scopes is a known gap).
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("events for a period, projected on the capability")
+                    .requires("urn:cap:personal:calendar:read:freebusy")
+                    .input(
+                        ArgSpec::new("period")
+                            .summary("the time window, captured from the IRI (default: week)")
+                            .binding(),
+                    )
+                    .input(
+                        ArgSpec::new("calendar")
+                            .summary("restrict to one named calendar")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("q")
+                            .summary("case-insensitive title+location search (needs read:detail)")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("as")
+                            .summary("the skolemized event graph (needs read:detail)")
+                            .one_of(["text/turtle"]),
+                    )
+                    .output("text/plain;charset=utf-8")
+                    .output("text/turtle"),
+            )
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("create an event in a named calendar")
+                    .requires("urn:cap:personal:calendar:write")
+                    .input(ArgSpec::new("calendar").summary("the target calendar"))
+                    .input(
+                        ArgSpec::new("start")
+                            .summary("RFC 3339, or YYYY-MM-DD for all-day")
+                            .class("http://www.w3.org/2001/XMLSchema#dateTime"),
+                    )
+                    .input(
+                        ArgSpec::new("title")
+                            .summary("the event title (default: the piped content)")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("end")
+                            .summary("RFC 3339 (default: +1h, or all-day for a date start)")
+                            .class("http://www.w3.org/2001/XMLSchema#dateTime")
+                            .optional(),
+                    )
+                    .input(ArgSpec::new("location").optional())
+                    .input(
+                        ArgSpec::new("all_day")
+                            .class("http://www.w3.org/2001/XMLSchema#boolean")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("uid")
+                            .summary("source identity, stamped as urn:event:{uid}")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("alert")
+                            .summary("alarms before start — \"1h 1d\", \"30m,15\", bare minutes")
+                            .optional(),
+                    )
+                    .output("text/plain;charset=utf-8"),
+            )
+            .action(
+                ActionSpec::new(Verb::Delete)
+                    .summary("delete an event by identity")
+                    .requires("urn:cap:personal:calendar:write")
+                    .input(ArgSpec::new("calendar").summary("the target calendar"))
+                    .input(ArgSpec::new("uid").summary("the event's iCal UID"))
+                    .input(
+                        ArgSpec::new("start")
+                            .summary("window hint for the occurrence search")
+                            .class("http://www.w3.org/2001/XMLSchema#dateTime")
+                            .optional(),
+                    )
+                    .output("text/plain;charset=utf-8"),
+            ),
     )
 }
 
@@ -716,7 +800,30 @@ pub fn calendars(config: Option<CalendarConfig>) -> FnEndpoint {
                     .summary("Sink: the account to create it on (default: configured, else iCloud)")
                     .optional(),
             )
-            .output("text/plain;charset=utf-8"),
+            .output("text/plain;charset=utf-8")
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("list every calendar with its account")
+                    .output("text/plain;charset=utf-8"),
+            )
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("create a calendar")
+                    .requires("urn:cap:personal:calendar:write")
+                    .input(
+                        ArgSpec::new("name")
+                            .summary("the calendar to create (default: the configured view)")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("account")
+                            .summary(
+                                "the account to create it on (default: configured, else iCloud)",
+                            )
+                            .optional(),
+                    )
+                    .output("text/plain;charset=utf-8"),
+            ),
     )
 }
 
@@ -824,6 +931,54 @@ mod tests {
             Request::new(Verb::Source, Iri::parse(iri).unwrap()),
             capability,
         ))
+    }
+
+    #[test]
+    fn the_action_manifold_shrinks_with_the_capability() {
+        // The S2 flagship demo, as a test: `urn:kernel:actions as=text/turtle`
+        // under an attenuated capability. A freebusy agent's manifold contains
+        // the calendar's Source action and simply LACKS Sink and Delete —
+        // affordance equals authorization, before any invocation is attempted.
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let manifold = |capability: &Capability| {
+            let request = Request::new(Verb::Source, Iri::parse("urn:kernel:actions").unwrap())
+                .with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec()));
+            let repr = block_on(kernel.issue(request, capability)).unwrap();
+            String::from_utf8(repr.bytes).unwrap()
+        };
+
+        let all = manifold(&Capability::root());
+        assert!(
+            all.contains("calendar:action:source> a ik:ActionMatch"),
+            "{all}"
+        );
+        assert!(
+            all.contains("calendar:action:sink> a ik:ActionMatch"),
+            "{all}"
+        );
+        assert!(
+            all.contains("calendar:action:delete> a ik:ActionMatch"),
+            "{all}"
+        );
+        assert!(
+            all.contains("ik:requires <urn:cap:personal:calendar:write>"),
+            "{all}"
+        );
+
+        let freebusy = Capability::scoped([
+            "urn:cap:kernel:inspect",
+            "urn:cap:personal:calendar:read:freebusy",
+        ]);
+        let scoped = manifold(&freebusy);
+        assert!(
+            scoped.contains("calendar:action:source>"),
+            "the read action is offered: {scoped}"
+        );
+        assert!(
+            !scoped.contains("calendar:action:sink"),
+            "the write action must not be OFFERED to a freebusy capability: {scoped}"
+        );
+        assert!(!scoped.contains("calendar:action:delete"), "{scoped}");
     }
 
     #[test]
