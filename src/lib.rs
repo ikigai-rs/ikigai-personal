@@ -86,6 +86,7 @@ pub fn contacts() -> FnEndpoint {
             .summary("The local address book, resolved through the operating system.")
             .verb(Verb::Source)
             .verb(Verb::Meta)
+            .requires("urn:cap:personal:contacts:read")
             .output("text/plain;charset=utf-8"),
     )
 }
@@ -686,6 +687,7 @@ pub fn availability() -> FnEndpoint {
                     .summary("the time window (default: week)")
                     .binding(),
             )
+            .requires("urn:cap:personal:calendar:read:freebusy")
             .output("text/plain;charset=utf-8"),
     )
 }
