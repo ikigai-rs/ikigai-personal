@@ -21,10 +21,21 @@ a month name · `YYYY-MM` · `YYYY-MM-DD` · a range `YYYY-MM-DD..YYYY-MM-DD`
 bare = `week`. `calendar=` restricts to one named calendar; `q=` searches
 case-insensitively over titles and locations.
 
+**Reads are scoped to the configured `view` calendar** (e.g. `Brian-Busy` — the
+derived union of the source calendars and org events, which by construction
+*excludes* non-source calendars like a spouse's shared calendar or a birthdays
+calendar). An explicit `calendar=` overrides it; with no config loaded a read is
+unscoped (all calendars). Scoping to the view is the safe default — it's what
+keeps a served free/busy from leaking a calendar that was never meant to go over
+the wire.
+
 Three representations, **projected on the capability**:
 
-- **detail text** — times, titles, calendars, locations (`…:read:detail`)
-- **free/busy text** — busy blocks only (`…:read:freebusy`)
+- **detail text** — times, titles, calendars, locations (`…:read:detail`);
+  free events (birthdays, holidays) are shown, flagged `· free`
+- **free/busy text** — busy blocks only (`…:read:freebusy`); events EventKit
+  marks *free* (birthdays, holidays) are **dropped** — they don't occupy time,
+  so they must never read as busy
 - **`as=text/turtle`** — the **skolemized event graph**: `urn:event:{uid}`
   subjects (no blank nodes), iCal RDF vocabulary, `ik:calendar` provenance,
   multi-valued `ik:alert` (minutes before start) — so calendars union and diff

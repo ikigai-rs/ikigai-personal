@@ -25,7 +25,9 @@ pub fn contacts() -> Option<String> {
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
-use objc2_event_kit::{EKAuthorizationStatus, EKCalendar, EKEntityType, EKEventStore, EKSource};
+use objc2_event_kit::{
+    EKAuthorizationStatus, EKCalendar, EKEntityType, EKEventAvailability, EKEventStore, EKSource,
+};
 use objc2_foundation::{NSError, NSString};
 
 /// An event store with calendar access ensured — asks TCC on first use (the
@@ -247,6 +249,11 @@ fn events_impl(
         });
         let location = unsafe { event.location() }.map(|s| s.to_string());
         let alerts = read_alerts(&event);
+        // Free/busy: birthdays and holidays report `Free` and must not count
+        // against availability. Treat anything that isn't explicitly `Free`
+        // (including `.notSupported`) as busy — never mark something free by
+        // accident.
+        let busy = unsafe { event.availability() } != EKEventAvailability::Free;
         out.push(super::EventInfo {
             uid,
             title,
@@ -254,6 +261,7 @@ fn events_impl(
             start,
             end,
             all_day: unsafe { event.isAllDay() },
+            busy,
             location,
             alerts,
         });

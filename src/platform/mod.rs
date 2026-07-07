@@ -45,6 +45,12 @@ pub struct EventInfo {
     pub end: String,
     /// An all-day event (start/end are dates, times are midnight).
     pub all_day: bool,
+    /// Whether the event actually occupies time — `availability != Free`
+    /// (EventKit's `EKEventAvailability`). Birthdays and holidays report `Free`
+    /// and must NOT count against availability; `.notSupported` is treated as
+    /// busy (conservative — never mark something free by accident). The
+    /// free/busy face drops the free ones; the detail face still shows them.
+    pub busy: bool,
     /// The location, when set.
     pub location: Option<String>,
     /// Alarms: minutes before start (relative alarms only), sorted.

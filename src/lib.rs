@@ -257,18 +257,26 @@ fn format_detail(label: &str, events: &[EventInfo]) -> String {
         if let Some(location) = &e.location {
             out.push_str(&format!("  @ {location}"));
         }
+        // Detail is the full view: show a free event (birthday, holiday) as such
+        // rather than dropping it the way the free/busy face does.
+        if !e.busy {
+            out.push_str("  · free");
+        }
         out.push('\n');
     }
     out
 }
 
 /// The free/busy text face: busy blocks only — no titles, calendars, locations.
+/// Events marked free (birthdays, holidays — `availability == Free`) are dropped:
+/// they don't occupy time, so they must not read as busy.
 fn format_freebusy(label: &str, events: &[EventInfo]) -> String {
-    if events.is_empty() {
+    let busy: Vec<&EventInfo> = events.iter().filter(|e| e.busy).collect();
+    if busy.is_empty() {
         return format!("availability — {label}\n\n  (free)\n");
     }
     let mut out = format!("availability — {label}\n\n");
-    for e in events {
+    for e in busy {
         let when = if e.all_day {
             format!("{}  all-day    ", date_of(&e.start))
         } else {
@@ -324,16 +332,38 @@ fn ttl_str(s: &str) -> String {
     )
 }
 
+/// Which calendar a read is scoped to, given the inline override and the config.
+/// Precedence: an explicit inline `calendar=<name>` wins; else the configured
+/// **view** calendar (e.g. "Brian-Busy" — the derived union of the source
+/// calendars and org events, already complete AND excluding non-source
+/// calendars like a spouse's shared calendar or a birthdays calendar); else
+/// (no config, or a config with no view) `None` = unscoped, ALL event
+/// calendars. Scoping to the view is the safe default — leaving it unscoped
+/// leaks calendars that were never meant to be served.
+fn scope_calendar(inline: Option<&str>, config: Option<&CalendarConfig>) -> Option<String> {
+    if let Some(name) = inline {
+        return Some(name.to_string());
+    }
+    config
+        .map(|c| c.view.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
 /// The events for an invocation: period from the grammar binding (default
-/// `week`), optional `calendar=` filter — real EventKit.
-fn events_for(inv: &Invocation<'_>) -> Result<Option<(String, Vec<EventInfo>)>> {
+/// `week`), scoped to one calendar — the inline `calendar=` override, else the
+/// configured view (see [`scope_calendar`]) — real EventKit.
+fn events_for(
+    inv: &Invocation<'_>,
+    config: Option<&CalendarConfig>,
+) -> Result<Option<(String, Vec<EventInfo>)>> {
     let period = inv
         .bindings
         .get("period")
         .map(str::to_string)
         .unwrap_or_else(|| "week".to_string());
     let (start, end, label) = period_range(&period, Local::now().date_naive())?;
-    let calendar = inv.inline_str("calendar").ok().map(str::to_string);
+    let calendar = scope_calendar(inv.inline_str("calendar").ok(), config);
     match platform::events(start, end, calendar.as_deref()) {
         None => Ok(None),
         Some(Ok(events)) => Ok(Some((label, events))),
@@ -344,8 +374,8 @@ fn events_for(inv: &Invocation<'_>) -> Result<Option<(String, Vec<EventInfo>)>> 
 /// `calendar`: real events for a period, projected on the capability — full
 /// detail with `…:read:detail` (and a Turtle face via `as=text/turtle`),
 /// free/busy with `…:read:freebusy`, denied with neither.
-pub fn calendar() -> FnEndpoint {
-    FnEndpoint::new("calendar", |inv: &Invocation<'_>| {
+pub fn calendar(config: Option<CalendarConfig>) -> FnEndpoint {
+    FnEndpoint::new("calendar", move |inv: &Invocation<'_>| {
         match inv.request.verb {
             Verb::Sink => return create_event(inv),
             Verb::Delete => return delete_event(inv),
@@ -384,7 +414,7 @@ pub fn calendar() -> FnEndpoint {
                 "urn:cap:personal:calendar:read:detail",
             ));
         }
-        let Some((label, mut events)) = events_for(inv)? else {
+        let Some((label, mut events)) = events_for(inv, config.as_ref())? else {
             return resolve("calendar", None);
         };
         if let Some(q) = query {
@@ -658,13 +688,13 @@ fn delete_event(inv: &Invocation<'_>) -> Result<Representation> {
 
 /// `availability`: the free/busy projection for a period — busy blocks only,
 /// gated on `urn:cap:personal:calendar:read:freebusy`.
-pub fn availability() -> FnEndpoint {
-    FnEndpoint::new("availability", |inv: &Invocation<'_>| {
+pub fn availability(config: Option<CalendarConfig>) -> FnEndpoint {
+    FnEndpoint::new("availability", move |inv: &Invocation<'_>| {
         let scope = read_scope("urn:personal:calendar", Some("freebusy"));
         if !inv.capability.allows(&scope) {
             return Err(denied("availability", &scope));
         }
-        let Some((label, events)) = events_for(inv)? else {
+        let Some((label, events)) = events_for(inv, config.as_ref())? else {
             return resolve("availability", None);
         };
         Ok(Representation::new(
@@ -676,9 +706,11 @@ pub fn availability() -> FnEndpoint {
         Description::new("availability")
             .title("Availability")
             .summary(
-                "Free/busy projection for a period — busy blocks only, no titles or \
-                 attendees. The same minimized view `calendar` yields under a free/busy \
-                 capability.",
+                "Free/busy projection for a period (urn:personal:availability:{period}: \
+                 today, tomorrow, week, month, a month name, YYYY-MM, YYYY-MM-DD; bare = \
+                 week) — busy blocks only, no titles or attendees. Free events (birthdays, \
+                 holidays) are dropped. The same minimized view `calendar` yields under a \
+                 free/busy capability.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -883,21 +915,33 @@ pub fn calendar_config(config: Option<CalendarConfig>) -> FnEndpoint {
 pub fn space(config: Option<CalendarConfig>) -> EndpointSpace {
     EndpointSpace::new()
         .bind(Exact::new("urn:personal:contacts"), contacts())
-        .bind(Exact::new("urn:personal:calendar"), calendar())
-        .bind(Exact::new("urn:personal:availability"), availability())
+        .bind(
+            Exact::new("urn:personal:calendar"),
+            calendar(config.clone()),
+        )
+        .bind(
+            Exact::new("urn:personal:availability"),
+            availability(config.clone()),
+        )
         .bind(
             Exact::new("urn:personal:calendars"),
             calendars(config.clone()),
         )
         .bind(
             Exact::new("urn:personal:calendar:config"),
-            calendar_config(config),
+            calendar_config(config.clone()),
         )
         // AFTER the exact binds: the period grammar must not shadow
         // urn:personal:calendar:config (first grammar match wins).
         .bind(
             UriTemplate::parse("urn:personal:calendar:{period}").expect("valid template"),
-            calendar(),
+            calendar(config.clone()),
+        )
+        // The availability period grammar, mirroring calendar's, so
+        // `urn:personal:availability:{period}` captures a period (bare stays week).
+        .bind(
+            UriTemplate::parse("urn:personal:availability:{period}").expect("valid template"),
+            availability(config),
         )
 }
 
@@ -1074,6 +1118,7 @@ mod tests {
                 start: "2026-07-02T11:00:00-07:00".into(),
                 end: "2026-07-02T12:00:00-07:00".into(),
                 all_day: false,
+                busy: true,
                 location: Some("Zoom".into()),
                 alerts: vec![60, 1440],
             },
@@ -1084,10 +1129,80 @@ mod tests {
                 start: "2026-07-02T18:30:00-07:00".into(),
                 end: "2026-07-02T19:30:00-07:00".into(),
                 all_day: false,
+                busy: true,
                 location: None,
                 alerts: Vec::new(),
             },
         ]
+    }
+
+    /// An all-day birthday: EventKit marks these `Free`, so `busy: false`. The
+    /// free/busy face must drop it (it doesn't occupy time); detail shows it.
+    fn free_birthday() -> EventInfo {
+        EventInfo {
+            uid: "BDAY-1".into(),
+            title: "Ada's birthday".into(),
+            calendar: "Birthdays".into(),
+            start: "2026-07-02T00:00:00-07:00".into(),
+            end: "2026-07-03T00:00:00-07:00".into(),
+            all_day: true,
+            busy: false,
+            location: None,
+            alerts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn freebusy_drops_free_events_but_detail_keeps_them() {
+        // A busy meeting + a free all-day birthday.
+        let mut events = sample_events();
+        events.push(free_birthday());
+
+        // Free/busy: the birthday must NOT appear as a busy block.
+        let busy = format_freebusy("today", &events);
+        assert!(busy.contains("11:00-12:00  busy"), "{busy}");
+        assert!(
+            !busy.contains("all-day"),
+            "the free birthday must be dropped from free/busy: {busy}"
+        );
+
+        // Detail: the birthday is still shown, flagged free.
+        let detail = format_detail("today", &events);
+        assert!(detail.contains("Ada's birthday"), "{detail}");
+        assert!(
+            detail.contains("· free"),
+            "free events show their status: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_all_free_period_reads_free() {
+        // Only free events -> the free/busy face collapses to "(free)".
+        let free_only = vec![free_birthday()];
+        let out = format_freebusy("today", &free_only);
+        assert!(out.contains("(free)"), "{out}");
+    }
+
+    #[test]
+    fn scope_defaults_to_the_view_and_the_inline_override_wins() {
+        let config =
+            CalendarConfig::from_json(r#"{ "view": "Brian-Busy", "sources": ["Brian"] }"#).unwrap();
+        // No config, no override -> unscoped (all calendars).
+        assert_eq!(scope_calendar(None, None), None);
+        // Config present -> default to the view calendar (the scoped union).
+        assert_eq!(
+            scope_calendar(None, Some(&config)).as_deref(),
+            Some("Brian-Busy")
+        );
+        // An explicit inline calendar= override wins over the configured view.
+        assert_eq!(
+            scope_calendar(Some("Bosatsu"), Some(&config)).as_deref(),
+            Some("Bosatsu")
+        );
+        // A config whose view is blank leaves the read unscoped rather than
+        // scoping to an empty name.
+        let no_view = CalendarConfig::from_json(r#"{ "view": "" }"#).unwrap();
+        assert_eq!(scope_calendar(None, Some(&no_view)), None);
     }
 
     #[test]
@@ -1259,6 +1374,25 @@ mod tests {
                 Iri::parse("urn:personal:calendar:fortnight").unwrap(),
             ),
             &Capability::root(),
+        ));
+        assert!(format!("{:?}", denied.unwrap_err()).contains("unknown period"));
+    }
+
+    #[test]
+    fn availability_binds_a_period_from_the_grammar() {
+        // `urn:personal:availability:{period}` must capture the period the same
+        // way calendar's grammar does. An invalid period proves the binding
+        // fires (period_range rejects it) WITHOUT reaching EventKit — the error
+        // surfaces after the cap check but before any platform call.
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let freebusy =
+            Capability::root().attenuate(["urn:cap:personal:calendar:read:freebusy".to_string()]);
+        let denied = block_on(kernel.issue(
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:personal:availability:fortnight").unwrap(),
+            ),
+            &freebusy,
         ));
         assert!(format!("{:?}", denied.unwrap_err()).contains("unknown period"));
     }
