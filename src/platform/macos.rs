@@ -34,7 +34,16 @@ use objc2_foundation::{NSError, NSString};
 /// prompt is attributed to the hosting terminal/app; a denial says how to fix
 /// it in System Settings). Created per call: cheap, and nothing Objective-C
 /// crosses a thread boundary.
+/// Bumped by [`observe_store`] on every EventKit change. A reused store keeps an
+/// in-memory cache that does NOT reflect external edits (Calendar.app, an iCloud sync)
+/// until `reset()`, so [`store`] resets when this generation has advanced past what the
+/// calling thread last synced. Gating on a change keeps the no-change hot path
+/// reset-free — a reset discards the calendar cache and would re-open the async populate
+/// race the long-lived store was introduced to fix.
+static CHANGE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn store() -> Result<Retained<EKEventStore>, String> {
+    use std::sync::atomic::Ordering;
     // ONE store per thread, reused: EventKit populates a fresh store's calendar
     // cache asynchronously, so rapid-fire store creation (a derivation pass
     // makes many calls) can race it into a briefly-incomplete calendar list —
@@ -43,12 +52,22 @@ fn store() -> Result<Retained<EKEventStore>, String> {
     thread_local! {
         static STORE: std::cell::RefCell<Option<Retained<EKEventStore>>> =
             const { std::cell::RefCell::new(None) };
+        // The change generation this thread's store was last refreshed at.
+        static SYNCED_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
+    let generation = CHANGE_GEN.load(Ordering::Acquire);
     if let Some(existing) = STORE.with(|cell| cell.borrow().clone()) {
+        // A change landed since this thread last read: drop the stale in-memory cache
+        // so the next fetch sees current data (the external edit / sync).
+        if SYNCED_GEN.with(|g| g.get()) != generation {
+            unsafe { existing.reset() };
+            SYNCED_GEN.with(|g| g.set(generation));
+        }
         return Ok(existing);
     }
     let created = fresh_store()?;
     STORE.with(|cell| *cell.borrow_mut() = Some(created.clone()));
+    SYNCED_GEN.with(|g| g.set(generation));
     Ok(created)
 }
 
@@ -450,6 +469,9 @@ pub fn observe_store(on_change: Box<dyn Fn() + Send>) -> Option<()> {
         let queue = NSOperationQueue::new();
         let block = block2::RcBlock::new(
             move |_notification: core::ptr::NonNull<objc2_foundation::NSNotification>| {
+                // Mark every thread's store stale, so the derive this triggers reads
+                // fresh data (a reused store won't see the change otherwise), then react.
+                CHANGE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
                 on_change();
             },
         );
