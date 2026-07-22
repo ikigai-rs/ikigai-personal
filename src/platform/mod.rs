@@ -53,6 +53,13 @@ pub struct EventInfo {
     pub busy: bool,
     /// The location, when set.
     pub location: Option<String>,
+    /// The notes body, when set — where a Teams invite's join details live.
+    /// Round-trips through EKEvent `.notes` (reads back as `ical:description`).
+    pub description: Option<String>,
+    /// The event's REAL URL, when it carries one (a Teams invite's join link).
+    /// Never the `urn:event:{uid}` identity token — that is stripped into `uid`
+    /// instead, and the write side owns the URL field for it.
+    pub url: Option<String>,
     /// Alarms: minutes before start (relative alarms only), sorted.
     pub alerts: Vec<u32>,
 }

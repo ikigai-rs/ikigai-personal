@@ -248,10 +248,16 @@ fn events_impl(
         // Identity round-trip: events this system CREATED carry their source
         // identity (urn:event:{uid}) in the URL field — prefer it, so a written
         // event reads back as the same graph subject and diffs converge.
-        let url_uid = unsafe { event.URL() }
+        let url_str = unsafe { event.URL() }
             .and_then(|u| u.absoluteString())
-            .map(|s| s.to_string())
+            .map(|s| s.to_string());
+        let url_uid = url_str
+            .as_deref()
             .and_then(|u| u.strip_prefix("urn:event:").map(str::to_string));
+        // A URL that is NOT the identity token is real event data — a Teams
+        // invite's join link rides here. The identity token is plumbing, never
+        // data, so it must not surface as the event's URL.
+        let url = url_str.filter(|u| !u.starts_with("urn:event:"));
         let store_uid = unsafe { event.calendarItemExternalIdentifier() }
             .map(|s| s.to_string())
             .unwrap_or_else(|| unsafe { event.calendarItemIdentifier() }.to_string());
@@ -267,6 +273,11 @@ fn events_impl(
             super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start)
         });
         let location = unsafe { event.location() }.map(|s| s.to_string());
+        // Empty notes read as absent: the write side only sets .notes when a
+        // description exists, so "" here would never converge with None there.
+        let description = unsafe { event.notes() }
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         let alerts = read_alerts(&event);
         // Free/busy: birthdays and holidays report `Free` and must not count
         // against availability. Treat anything that isn't explicitly `Free`
@@ -282,6 +293,8 @@ fn events_impl(
             all_day: unsafe { event.isAllDay() },
             busy,
             location,
+            description,
+            url,
             alerts,
         });
     }
@@ -334,6 +347,7 @@ pub fn create_event(
     end_epoch: i64,
     all_day: bool,
     location: Option<&str>,
+    description: Option<&str>,
     source_uid: Option<&str>,
     alerts: &[u32],
 ) -> Option<Result<String, String>> {
@@ -344,6 +358,7 @@ pub fn create_event(
         end_epoch,
         all_day,
         location,
+        description,
         source_uid,
         alerts,
     ))
@@ -357,6 +372,7 @@ fn create_event_impl(
     end_epoch: i64,
     all_day: bool,
     location: Option<&str>,
+    description: Option<&str>,
     source_uid: Option<&str>,
     alerts: &[u32],
 ) -> Result<String, String> {
@@ -377,6 +393,12 @@ fn create_event_impl(
         event.setAllDay(all_day);
         if let Some(location) = location {
             event.setLocation(Some(&NSString::from_str(location)));
+        }
+        // The description lands in .notes — .url is reserved for the identity
+        // token below, and notes is the robust carrier (NSURL parsing can nil
+        // out on odd characters; notes takes any string).
+        if let Some(description) = description {
+            event.setNotes(Some(&NSString::from_str(description)));
         }
         if let Some(uid) = source_uid {
             let url = NSURL::URLWithString(&NSString::from_str(&format!("urn:event:{uid}")));

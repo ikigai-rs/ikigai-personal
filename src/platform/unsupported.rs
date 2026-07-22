@@ -34,6 +34,7 @@ pub fn create_event(
     _end_epoch: i64,
     _all_day: bool,
     _location: Option<&str>,
+    _description: Option<&str>,
     _source_uid: Option<&str>,
     _alerts: &[u32],
 ) -> Option<Result<String, String>> {
