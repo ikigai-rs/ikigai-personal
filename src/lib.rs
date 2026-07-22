@@ -313,6 +313,16 @@ fn format_turtle(events: &[EventInfo]) -> String {
         if let Some(location) = &e.location {
             props.push(format!("ical:location {}", ttl_str(location)));
         }
+        if let Some(description) = &e.description {
+            props.push(format!("ical:description {}", ttl_str(description)));
+        }
+        if let Some(url) = &e.url {
+            props.push(format!("ical:url {}", ttl_str(url)));
+        }
+        // Multi-valued, like ik:alert — one triple per attendee.
+        for attendee in &e.attendees {
+            props.push(format!("ical:attendee {}", ttl_str(attendee)));
+        }
         ttl.push_str(&format!(
             "\n<urn:event:{}> {} .\n",
             e.uid.replace(['<', '>', ' '], "-"),
@@ -322,13 +332,17 @@ fn format_turtle(events: &[EventInfo]) -> String {
     ttl
 }
 
-/// A Turtle string literal (quote-and-escape).
+/// A Turtle string literal (quote-and-escape). Newlines are ESCAPED, not
+/// flattened: a multi-line description must survive the graph face with its
+/// line structure intact so the org ingestion can write it back as a readable
+/// heading body. CRs are dropped so an .ics's \r\n and a written \n converge.
 fn ttl_str(s: &str) -> String {
     format!(
         "\"{}\"",
         s.replace('\\', "\\\\")
             .replace('\"', "\\\"")
-            .replace('\n', " ")
+            .replace('\r', "")
+            .replace('\n', "\\n")
     )
 }
 
@@ -506,6 +520,11 @@ pub fn calendar(config: Option<CalendarConfig>) -> FnEndpoint {
                     .optional(),
             )
             .input(
+                ArgSpec::new("description")
+                    .summary("Sink: the event notes (a derived event's join link rides here)")
+                    .optional(),
+            )
+            .input(
                 ArgSpec::new("uid")
                     .summary("Sink: source identity (urn:event:{uid} on the event's URL) · Delete: REQUIRED")
                     .optional(),
@@ -587,6 +606,7 @@ pub fn calendar(config: Option<CalendarConfig>) -> FnEndpoint {
                             .optional(),
                     )
                     .input(ArgSpec::new("location").optional())
+                    .input(ArgSpec::new("description").optional())
                     .input(
                         ArgSpec::new("all_day")
                             .class("http://www.w3.org/2001/XMLSchema#boolean")
@@ -657,6 +677,7 @@ fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
             .map(|v| v == "true")
             .unwrap_or(false);
     let location = inv.inline_str("location").ok();
+    let description = inv.inline_str("description").ok();
     let uid = inv.inline_str("uid").ok();
     let alerts = inv
         .inline_str("alert")
@@ -665,7 +686,15 @@ fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
     resolve(
         "calendar",
         flatten(platform::create_event(
-            calendar, title, start, end, all_day, location, uid, &alerts,
+            calendar,
+            title,
+            start,
+            end,
+            all_day,
+            location,
+            description,
+            uid,
+            &alerts,
         ))?,
     )
 }
@@ -1149,6 +1178,9 @@ mod tests {
                 all_day: false,
                 busy: true,
                 location: Some("Zoom".into()),
+                description: None,
+                url: None,
+                attendees: Vec::new(),
                 alerts: vec![60, 1440],
             },
             EventInfo {
@@ -1160,6 +1192,9 @@ mod tests {
                 all_day: false,
                 busy: true,
                 location: None,
+                description: None,
+                url: None,
+                attendees: Vec::new(),
                 alerts: Vec::new(),
             },
         ]
@@ -1177,6 +1212,9 @@ mod tests {
             all_day: true,
             busy: false,
             location: None,
+            description: None,
+            url: None,
+            attendees: Vec::new(),
             alerts: Vec::new(),
         }
     }
@@ -1304,6 +1342,37 @@ mod tests {
         assert!(ttl.contains("ik:alert 60"));
         assert!(ttl.contains("ik:alert 1440"));
         assert!(!ttl.contains("_:"), "no blank nodes — diff must be set ops");
+    }
+
+    #[test]
+    fn turtle_carries_description_and_a_real_url() {
+        // A Teams invite: multi-line notes + a real join URL. The notes emit as
+        // ical:description with the newlines ESCAPED (the org ingestion writes
+        // them back as a multi-line heading body); the real URL emits as
+        // ical:url. An event without either emits neither predicate.
+        let mut events = sample_events();
+        events[0].description = Some("Join the meeting:\r\nhttps://teams.microsoft.com/l/x".into());
+        events[0].url = Some("https://teams.microsoft.com/l/meetup-join/abc".into());
+        events[0].attendees = vec!["Ada Lovelace".into(), "grace@example.com".into()];
+        let ttl = format_turtle(&events);
+        assert!(
+            ttl.contains(
+                "ical:description \"Join the meeting:\\nhttps://teams.microsoft.com/l/x\""
+            ),
+            "newlines escaped (CR dropped), not flattened: {ttl}"
+        );
+        assert!(ttl.contains("ical:url \"https://teams.microsoft.com/l/meetup-join/abc\""));
+        // attendees are multi-valued — one triple each, read-only data
+        assert!(ttl.contains("ical:attendee \"Ada Lovelace\""));
+        assert!(ttl.contains("ical:attendee \"grace@example.com\""));
+        // the second sample event carries none of these
+        let bare = ttl
+            .split("<urn:event:DEF-456>")
+            .nth(1)
+            .expect("second event");
+        assert!(!bare.contains("ical:description"));
+        assert!(!bare.contains("ical:url"));
+        assert!(!bare.contains("ical:attendee"));
     }
 
     #[test]
