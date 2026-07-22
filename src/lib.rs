@@ -333,21 +333,39 @@ fn ttl_str(s: &str) -> String {
 }
 
 /// Which calendar a read is scoped to, given the inline override and the config.
-/// Precedence: an explicit inline `calendar=<name>` wins; else the configured
-/// **view** calendar (e.g. "Brian-Busy" — the derived union of the source
-/// calendars and org events, already complete AND excluding non-source
-/// calendars like a spouse's shared calendar or a birthdays calendar); else
-/// (no config, or a config with no view) `None` = unscoped, ALL event
-/// calendars. Scoping to the view is the safe default — leaving it unscoped
-/// leaks calendars that were never meant to be served.
-fn scope_calendar(inline: Option<&str>, config: Option<&CalendarConfig>) -> Option<String> {
-    if let Some(name) = inline {
-        return Some(name.to_string());
+///
+/// When a **view** is configured (e.g. "Brian-Busy" — the derived union of the
+/// source calendars and org events, already complete AND excluding non-source
+/// calendars like a spouse's shared calendar or a birthdays calendar), that
+/// view is an **allowlist**: an inline `calendar=<name>` may only name a
+/// calendar the view already serves (the view itself, one of its `sources`, or
+/// the `inbox`) — anything else is rejected. Otherwise a holder of
+/// `read:detail`/`read:freebusy` could pass `calendar=<any name>` and read a
+/// calendar the view was built to exclude; the capability gate only decides
+/// WHICH FIELDS (detail vs freebusy), never WHICH CALENDAR.
+///
+/// With no configured view (no config, or a config whose view is blank) there
+/// is nothing to attenuate against, so the inline override passes through and,
+/// absent an override, the read stays unscoped (`None` = ALL event calendars).
+fn scope_calendar(inline: Option<&str>, config: Option<&CalendarConfig>) -> Result<Option<String>> {
+    let view = config.map(|c| c.view.trim()).filter(|v| !v.is_empty());
+    match inline {
+        Some(name) => {
+            // A configured view is the safe default AND the allowlist: an inline
+            // override may only widen to a calendar the view already serves,
+            // never escape it to one that was meant to be excluded.
+            if let (Some(view), Some(config)) = (view, config) {
+                if !config.serves(name) {
+                    return Err(Error::Endpoint(format!(
+                        "urn:personal:calendar: calendar={name:?} is not served by the \
+                         configured view {view:?} — allowed: the view, its sources, or the inbox"
+                    )));
+                }
+            }
+            Ok(Some(name.to_string()))
+        }
+        None => Ok(view.map(str::to_string)),
     }
-    config
-        .map(|c| c.view.trim())
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
 }
 
 /// The events for an invocation: period from the grammar binding (default
@@ -363,7 +381,7 @@ fn events_for(
         .map(str::to_string)
         .unwrap_or_else(|| "week".to_string());
     let (start, end, label) = period_range(&period, Local::now().date_naive())?;
-    let calendar = scope_calendar(inv.inline_str("calendar").ok(), config);
+    let calendar = scope_calendar(inv.inline_str("calendar").ok(), config)?;
     match platform::events(start, end, calendar.as_deref()) {
         None => Ok(None),
         Some(Ok(events)) => Ok(Some((label, events))),
@@ -758,6 +776,17 @@ impl CalendarConfig {
         serde_json::from_str(json).map_err(|e| {
             Error::Endpoint(format!("urn:personal:calendar:config: invalid JSON: {e}"))
         })
+    }
+
+    /// Whether a read scoped to this view may name `calendar`: the view itself,
+    /// one of its declared `sources`, or the `inbox`. Anything else is a
+    /// calendar the view was built to exclude — see [`scope_calendar`], which
+    /// uses this as an allowlist for the inline `calendar=` override.
+    fn serves(&self, calendar: &str) -> bool {
+        let calendar = calendar.trim();
+        self.view.trim() == calendar
+            || self.sources.iter().any(|s| s.trim() == calendar)
+            || self.inbox.as_deref().map(str::trim) == Some(calendar)
     }
 }
 
@@ -1184,25 +1213,49 @@ mod tests {
     }
 
     #[test]
-    fn scope_defaults_to_the_view_and_the_inline_override_wins() {
-        let config =
-            CalendarConfig::from_json(r#"{ "view": "Brian-Busy", "sources": ["Brian"] }"#).unwrap();
+    fn scope_defaults_to_the_view_and_attenuates_the_inline_override() {
+        let config = CalendarConfig::from_json(
+            r#"{ "view": "Brian-Busy", "sources": ["Brian", "Bosatsu"], "inbox": "Brian-New" }"#,
+        )
+        .unwrap();
         // No config, no override -> unscoped (all calendars).
-        assert_eq!(scope_calendar(None, None), None);
+        assert_eq!(scope_calendar(None, None).unwrap(), None);
         // Config present -> default to the view calendar (the scoped union).
         assert_eq!(
-            scope_calendar(None, Some(&config)).as_deref(),
+            scope_calendar(None, Some(&config)).unwrap().as_deref(),
             Some("Brian-Busy")
         );
-        // An explicit inline calendar= override wins over the configured view.
-        assert_eq!(
-            scope_calendar(Some("Bosatsu"), Some(&config)).as_deref(),
-            Some("Bosatsu")
+        // With a view configured, an inline override may name only a calendar
+        // the view already serves: the view itself, a source, or the inbox.
+        for allowed in ["Brian-Busy", "Brian", "Bosatsu", "Brian-New"] {
+            assert_eq!(
+                scope_calendar(Some(allowed), Some(&config))
+                    .unwrap()
+                    .as_deref(),
+                Some(allowed),
+                "{allowed} is served by the view and must pass through"
+            );
+        }
+        // The vulnerability: an inline calendar= naming a calendar the view was
+        // built to EXCLUDE (a spouse's shared calendar) must NOT reach the
+        // platform — it is rejected, not honored.
+        let escaped = scope_calendar(Some("Spouse-Personal"), Some(&config));
+        assert!(
+            escaped.is_err(),
+            "an inline override outside the view's allowlist must be rejected, got {escaped:?}"
         );
-        // A config whose view is blank leaves the read unscoped rather than
-        // scoping to an empty name.
+
+        // A config whose view is blank has nothing to attenuate against: the
+        // inline override passes through, and absent one the read is unscoped.
         let no_view = CalendarConfig::from_json(r#"{ "view": "" }"#).unwrap();
-        assert_eq!(scope_calendar(None, Some(&no_view)), None);
+        assert_eq!(scope_calendar(None, Some(&no_view)).unwrap(), None);
+        assert_eq!(
+            scope_calendar(Some("Anything"), Some(&no_view))
+                .unwrap()
+                .as_deref(),
+            Some("Anything"),
+            "no configured view means no allowlist to enforce"
+        );
     }
 
     #[test]
