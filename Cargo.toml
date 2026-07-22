@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-personal"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Personal contexts for ikigai — OS-backed resources (contacts, calendar, availability) under urn:personal:*. macOS-first; Windows and Linux build but report unsupported for now."
