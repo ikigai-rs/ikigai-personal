@@ -278,6 +278,7 @@ fn events_impl(
         let description = unsafe { event.notes() }
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty());
+        let attendees = read_attendees(&event);
         let alerts = read_alerts(&event);
         // Free/busy: birthdays and holidays report `Free` and must not count
         // against availability. Treat anything that isn't explicitly `Free`
@@ -295,11 +296,34 @@ fn events_impl(
             location,
             description,
             url,
+            attendees,
             alerts,
         });
     }
     out.sort_by(|a, b| a.start.cmp(&b.start));
     Ok(out)
+}
+
+/// Attendee display names, falling back to the participant URL with any
+/// `mailto:` scheme stripped (an unnamed attendee is still an address).
+/// EventKit exposes attendees READ-ONLY — capture-side data, never written.
+fn read_attendees(event: &objc2_event_kit::EKEvent) -> Vec<String> {
+    let Some(list) = (unsafe { event.attendees() }) else {
+        return Vec::new();
+    };
+    (0..list.count())
+        .map(|i| list.objectAtIndex(i))
+        .filter_map(|participant| {
+            unsafe { participant.name() }
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    unsafe { participant.URL() }
+                        .absoluteString()
+                        .map(|s| s.to_string().trim_start_matches("mailto:").to_string())
+                })
+                .filter(|s| !s.is_empty())
+        })
+        .collect()
 }
 
 /// The event's relative alarms as minutes-before-start, sorted (absolute-date

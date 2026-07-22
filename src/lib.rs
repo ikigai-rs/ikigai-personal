@@ -319,6 +319,10 @@ fn format_turtle(events: &[EventInfo]) -> String {
         if let Some(url) = &e.url {
             props.push(format!("ical:url {}", ttl_str(url)));
         }
+        // Multi-valued, like ik:alert — one triple per attendee.
+        for attendee in &e.attendees {
+            props.push(format!("ical:attendee {}", ttl_str(attendee)));
+        }
         ttl.push_str(&format!(
             "\n<urn:event:{}> {} .\n",
             e.uid.replace(['<', '>', ' '], "-"),
@@ -1176,6 +1180,7 @@ mod tests {
                 location: Some("Zoom".into()),
                 description: None,
                 url: None,
+                attendees: Vec::new(),
                 alerts: vec![60, 1440],
             },
             EventInfo {
@@ -1189,6 +1194,7 @@ mod tests {
                 location: None,
                 description: None,
                 url: None,
+                attendees: Vec::new(),
                 alerts: Vec::new(),
             },
         ]
@@ -1208,6 +1214,7 @@ mod tests {
             location: None,
             description: None,
             url: None,
+            attendees: Vec::new(),
             alerts: Vec::new(),
         }
     }
@@ -1346,6 +1353,7 @@ mod tests {
         let mut events = sample_events();
         events[0].description = Some("Join the meeting:\r\nhttps://teams.microsoft.com/l/x".into());
         events[0].url = Some("https://teams.microsoft.com/l/meetup-join/abc".into());
+        events[0].attendees = vec!["Ada Lovelace".into(), "grace@example.com".into()];
         let ttl = format_turtle(&events);
         assert!(
             ttl.contains(
@@ -1354,13 +1362,17 @@ mod tests {
             "newlines escaped (CR dropped), not flattened: {ttl}"
         );
         assert!(ttl.contains("ical:url \"https://teams.microsoft.com/l/meetup-join/abc\""));
-        // the second sample event carries neither
+        // attendees are multi-valued — one triple each, read-only data
+        assert!(ttl.contains("ical:attendee \"Ada Lovelace\""));
+        assert!(ttl.contains("ical:attendee \"grace@example.com\""));
+        // the second sample event carries none of these
         let bare = ttl
             .split("<urn:event:DEF-456>")
             .nth(1)
             .expect("second event");
         assert!(!bare.contains("ical:description"));
         assert!(!bare.contains("ical:url"));
+        assert!(!bare.contains("ical:attendee"));
     }
 
     #[test]
