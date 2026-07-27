@@ -241,6 +241,81 @@ fn date_of(rfc3339: &str) -> &str {
     rfc3339.split_once('T').map(|(d, _)| d).unwrap_or(rfc3339)
 }
 
+/// The day-by-day spans an event covers — one `(date, when)` per calendar day it
+/// touches, so a MULTI-DAY event (a 3-day conference) blocks every day it spans,
+/// not just the first. Without this a `[start, end)` event rendered only its
+/// start date, leaving the rest of the span reading as free — both in the human
+/// view and in the free/busy text the booking handler parses.
+///
+/// Days are walked in the EVENT's own UTC offset (the offset carried in its RFC
+/// 3339 bounds — the zone EventKit stored it in, matching what the calendar app
+/// shows), NOT the machine's `Local` — so the dates are the event's real dates
+/// and the result is timezone-stable (the same on a laptop as in CI).
+///
+/// `when` is `all-day    ` for an all-day event or a day the event fully fills,
+/// else the `HH:MM-HH:MM` slice inside that day. A period-straddling event may
+/// list a day just outside a period query — safe (it over-reports busy), and the
+/// common case (an event contained in the period) is exact.
+fn day_lines(e: &EventInfo) -> Vec<(String, String)> {
+    // Fallback whenever the bounds won't parse or the span is degenerate: one
+    // line at the start date (string-sliced, event-zone), so nothing is dropped.
+    let single = || {
+        let when = if e.all_day {
+            "all-day    ".to_string()
+        } else {
+            format!("{}-{}", hhmm(&e.start), hhmm(&e.end))
+        };
+        vec![(date_of(&e.start).to_string(), when)]
+    };
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    let (Some(start), Some(end)) = (parse(&e.start), parse(&e.end)) else {
+        return single();
+    };
+    if end <= start {
+        return single();
+    }
+    // The event's own offset defines its calendar days.
+    let tz = *start.offset();
+    let midnight = |d: NaiveDate| {
+        tz.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+    };
+    let mut day = start.date_naive();
+    let mut lines = Vec::new();
+    // Both midnights are always Some for a fixed offset; the `while let` treats a
+    // None (impossible here) as end-of-loop, and keeps clippy happy.
+    while let (Some(day_start), Some(day_end)) = (midnight(day), midnight(day + Duration::days(1)))
+    {
+        let seg_start = start.max(day_start);
+        let seg_end = end.min(day_end);
+        if seg_start >= seg_end {
+            break;
+        }
+        let when = if e.all_day || (seg_start == day_start && seg_end == day_end) {
+            "all-day    ".to_string()
+        } else {
+            // A slice running to the next midnight reads as `24:00`, not a
+            // confusing `00:00`, so the booking parser sees a real end-of-day.
+            let end_str = if seg_end == day_end {
+                "24:00".to_string()
+            } else {
+                seg_end.format("%H:%M").to_string()
+            };
+            format!("{}-{}", seg_start.format("%H:%M"), end_str)
+        };
+        lines.push((day.to_string(), when));
+        if end <= day_end {
+            break;
+        }
+        day += Duration::days(1);
+    }
+    if lines.is_empty() {
+        single()
+    } else {
+        lines
+    }
+}
+
 /// The detailed text face: date, times, title, calendar, location.
 fn format_detail(label: &str, events: &[EventInfo]) -> String {
     if events.is_empty() {
@@ -248,21 +323,18 @@ fn format_detail(label: &str, events: &[EventInfo]) -> String {
     }
     let mut out = format!("calendar — {label}\n\n");
     for e in events {
-        let when = if e.all_day {
-            format!("{}  all-day    ", date_of(&e.start))
-        } else {
-            format!("{}  {}-{}", date_of(&e.start), hhmm(&e.start), hhmm(&e.end))
-        };
-        out.push_str(&format!("  {when}  {}  [{}]", e.title, e.calendar));
-        if let Some(location) = &e.location {
-            out.push_str(&format!("  @ {location}"));
+        for (date, when) in day_lines(e) {
+            out.push_str(&format!("  {date}  {when}  {}  [{}]", e.title, e.calendar));
+            if let Some(location) = &e.location {
+                out.push_str(&format!("  @ {location}"));
+            }
+            // Detail is the full view: show a free event (birthday, holiday) as such
+            // rather than dropping it the way the free/busy face does.
+            if !e.busy {
+                out.push_str("  · free");
+            }
+            out.push('\n');
         }
-        // Detail is the full view: show a free event (birthday, holiday) as such
-        // rather than dropping it the way the free/busy face does.
-        if !e.busy {
-            out.push_str("  · free");
-        }
-        out.push('\n');
     }
     out
 }
@@ -277,12 +349,9 @@ fn format_freebusy(label: &str, events: &[EventInfo]) -> String {
     }
     let mut out = format!("availability — {label}\n\n");
     for e in busy {
-        let when = if e.all_day {
-            format!("{}  all-day    ", date_of(&e.start))
-        } else {
-            format!("{}  {}-{}", date_of(&e.start), hhmm(&e.start), hhmm(&e.end))
-        };
-        out.push_str(&format!("  {when}  busy\n"));
+        for (date, when) in day_lines(e) {
+            out.push_str(&format!("  {date}  {when}  busy\n"));
+        }
     }
     out
 }
@@ -1248,6 +1317,66 @@ mod tests {
         let free_only = vec![free_birthday()];
         let out = format_freebusy("today", &free_only);
         assert!(out.contains("(free)"), "{out}");
+    }
+
+    #[test]
+    fn a_multi_day_event_blocks_every_day_it_spans() {
+        // Uberconf, an all-day conference 14th–17th: ONE EventKit event, end at the
+        // exclusive next-day midnight. It must show a busy line on all FOUR days —
+        // the bug was it rendered only the 14th, leaving 15–17 reading as free (both
+        // to a human and to the booking handler that parses this text).
+        let uberconf = EventInfo {
+            uid: "UBERCONF-2026".into(),
+            title: "Uberconf".into(),
+            calendar: "Bosatsu".into(),
+            start: "2026-06-14T00:00:00-06:00".into(),
+            end: "2026-06-18T00:00:00-06:00".into(),
+            all_day: true,
+            busy: true,
+            location: None,
+            description: None,
+            url: None,
+            attendees: Vec::new(),
+            alerts: Vec::new(),
+        };
+        let busy = format_freebusy("month", std::slice::from_ref(&uberconf));
+        for day in ["2026-06-14", "2026-06-15", "2026-06-16", "2026-06-17"] {
+            assert!(busy.contains(day), "must block {day}: {busy}");
+        }
+        assert!(
+            !busy.contains("2026-06-18"),
+            "exclusive end — the 18th stays free: {busy}"
+        );
+        assert_eq!(
+            busy.matches("busy").count(),
+            4,
+            "one busy line per spanned day: {busy}"
+        );
+        assert_eq!(
+            busy.matches("all-day").count(),
+            4,
+            "all four days read all-day: {busy}"
+        );
+
+        let detail = format_detail("month", std::slice::from_ref(&uberconf));
+        assert_eq!(
+            detail.matches("Uberconf").count(),
+            4,
+            "detail shows the conference on each spanned day: {detail}"
+        );
+    }
+
+    #[test]
+    fn single_day_events_stay_one_line() {
+        // Regression guard: the multi-day fix must not multiply a normal event.
+        let busy = format_freebusy("today", &sample_events());
+        assert_eq!(
+            busy.matches("busy").count(),
+            2,
+            "two single-day meetings → two lines: {busy}"
+        );
+        assert!(busy.contains("11:00-12:00"), "{busy}");
+        assert!(busy.contains("18:30-19:30"), "{busy}");
     }
 
     #[test]
