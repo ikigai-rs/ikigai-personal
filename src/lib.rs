@@ -1181,7 +1181,7 @@ mod tests {
                 &read_only,
             ),
         );
-        assert!(format!("{:?}", denied.unwrap_err()).contains("not authorized"));
+        assert!(matches!(denied.unwrap_err(), ikigai_core::Error::Denied(_)));
     }
 
     #[test]
@@ -1232,7 +1232,7 @@ mod tests {
             "urn:personal:availability",
         ] {
             let err = source(iri, &none).unwrap_err();
-            assert!(format!("{err:?}").contains("not authorized"), "{iri}");
+            assert!(matches!(err, ikigai_core::Error::Denied(_)), "{iri}");
         }
     }
 
@@ -1532,7 +1532,7 @@ mod tests {
             Request::new(Verb::Sink, Iri::parse("urn:personal:calendar").unwrap()),
             &read_only,
         ));
-        assert!(format!("{:?}", denied.unwrap_err()).contains("not authorized"));
+        assert!(matches!(denied.unwrap_err(), ikigai_core::Error::Denied(_)));
         // root without calendar= fails BEFORE any platform call
         let missing = block_on(
             kernel.issue(
