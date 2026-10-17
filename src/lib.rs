@@ -24,6 +24,7 @@
 //! week without ever learning what I'm doing"* — and it's why detail and free/busy
 //! are one resource with two capability-scoped views rather than two resources.
 
+pub mod caldav;
 mod platform;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
