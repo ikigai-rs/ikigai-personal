@@ -462,7 +462,7 @@ fn trigger_minutes(v: &str) -> Option<u32> {
 
 /// Every VEVENT in an iCalendar document as an [`EventInfo`]. Recurring events
 /// (RRULE, or expanded instances carrying RECURRENCE-ID) get per-occurrence
-/// uids via [`occurrence_uid`]; cancelled events are dropped.
+/// uids via `occurrence_uid`; cancelled events are dropped.
 pub fn parse_ics(ics: &str, calendar: &str) -> Vec<EventInfo> {
     let props = unfold(ics);
     let mut out = vec![];
