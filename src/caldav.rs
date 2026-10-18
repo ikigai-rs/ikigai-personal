@@ -6,7 +6,8 @@
 //!
 //! Limits: `TZID`-qualified times are read as local floating time (no tz
 //! database); `DURATION` ends are not interpreted; vCard/CardDAV is not covered.
-//! Not yet exercised against a real iCloud/Fastmail/Nextcloud/Radicale server.
+//! Not wired to `urn:http` yet: it carries only GET/HEAD/POST/PUT/PATCH/DELETE,
+//! not PROPFIND/REPORT. Not yet exercised against a real iCloud/Fastmail/Nextcloud/Radicale server.
 
 use crate::platform::{occurrence_uid, CalendarInfo, EventInfo};
 use chrono::{Duration, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
@@ -31,25 +32,14 @@ fn xml_headers(depth: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// `Authorization: Basic` value. The password comes from `ikigai-secret` by
-/// name at call time; it is never stored in personal.toml.
-pub fn basic_auth(user: &str, password: &str) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let data = format!("{user}:{password}").into_bytes();
-    let mut out = String::from("Basic ");
-    for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16
-            | (*c.get(1).unwrap_or(&0) as u32) << 8
-            | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= c.len() {
-                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+/// `Authorization: Basic` value, built by the shared `ikigai-http` helper. The
+/// password comes from `ikigai-secret` by name at call time; it is never stored
+/// in personal.toml. The error names the rule broken (its stable code) and never
+/// echoes the user id or password.
+pub fn basic_auth(user: &str, password: &str) -> Result<String, String> {
+    ikigai_http::auth::basic(user, password)
+        .map(ikigai_http::auth::Authorization::into_string)
+        .map_err(|e| format!("caldav credentials refused: {}", e.code()))
 }
 
 /// PROPFIND (Depth 1) on the calendar home: lists calendars.
@@ -656,9 +646,12 @@ mod tests {
     #[test]
     fn requests_and_auth() {
         assert_eq!(
-            basic_auth("Aladdin", "open sesame"),
+            basic_auth("Aladdin", "open sesame").unwrap(),
             "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
         );
+        let err = basic_auth("a:b", "hunter2").unwrap_err();
+        assert_eq!(err, "caldav credentials refused: basic-user-id-colon");
+        assert!(!err.contains("hunter2"));
         let q = report_calendar_query("/c/", 0, 86400);
         assert_eq!(q.method, "REPORT");
         assert!(q.body.contains(r#"start="19700101T000000Z""#));
