@@ -24,6 +24,7 @@
 //! week without ever learning what I'm doing"* — and it's why detail and free/busy
 //! are one resource with two capability-scoped views rather than two resources.
 
+pub mod caldav;
 mod platform;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
@@ -1122,15 +1123,15 @@ mod tests {
 
         let all = manifold(&Capability::root());
         assert!(
-            all.contains("calendar:action:source> a ik:ActionMatch"),
+            all.contains("match:source:urn:personal:calendar> a ik:ActionMatch"),
             "{all}"
         );
         assert!(
-            all.contains("calendar:action:sink> a ik:ActionMatch"),
+            all.contains("match:sink:urn:personal:calendar> a ik:ActionMatch"),
             "{all}"
         );
         assert!(
-            all.contains("calendar:action:delete> a ik:ActionMatch"),
+            all.contains("match:delete:urn:personal:calendar> a ik:ActionMatch"),
             "{all}"
         );
         assert!(
@@ -1144,14 +1145,17 @@ mod tests {
         ]);
         let scoped = manifold(&freebusy);
         assert!(
-            scoped.contains("calendar:action:source>"),
+            scoped.contains("match:source:urn:personal:calendar>"),
             "the read action is offered: {scoped}"
         );
         assert!(
-            !scoped.contains("calendar:action:sink"),
+            !scoped.contains("match:sink:urn:personal:calendar>"),
             "the write action must not be OFFERED to a freebusy capability: {scoped}"
         );
-        assert!(!scoped.contains("calendar:action:delete"), "{scoped}");
+        assert!(
+            !scoped.contains("match:delete:urn:personal:calendar>"),
+            "{scoped}"
+        );
     }
 
     #[test]
