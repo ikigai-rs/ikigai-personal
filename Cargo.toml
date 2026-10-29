@@ -15,7 +15,7 @@ categories = ["os"]
 # 0.2.0 is the streams release (ledger #2261). The old "0.1.35" pin meant
 # <0.2.0 under 0.x rules, so moving onto it is an explicit bump.
 ikigai-core = "0.2.0" # ActionSpec (per-verb contracts)
-ikigai-http = "0.4.0" # auth::basic — the shared Authorization helper
+ikigai-http = "0.5.0" # auth::basic — the shared Authorization helper
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Local-time period math (today/week/month partitions). Clock only — no parsing
