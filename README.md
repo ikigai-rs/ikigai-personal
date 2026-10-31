@@ -106,6 +106,10 @@ let kernel = Kernel::new(Arc::new(ikigai_personal::space(config)));
 
 Personal data is treated as a live fact and is **uncacheable**.
 
+## Accessibility
+
+The calendar, availability and contacts text this crate writes, the rules it follows, how it is tested and its known limitations are in [ACCESSIBILITY.md](ACCESSIBILITY.md). Report a barrier with an issue carrying the `accessibility` label.
+
 ## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
