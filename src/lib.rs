@@ -33,6 +33,7 @@ use ikigai_core::{
     ReprType, Representation, Result, UriTemplate, Verb,
 };
 use serde::Deserialize;
+use std::fmt::Write as _;
 
 pub use platform::{CalendarInfo, EventInfo};
 
@@ -248,10 +249,8 @@ fn date_of(rfc3339: &str) -> &str {
 /// start date, leaving the rest of the span reading as free — both in the human
 /// view and in the free/busy text the booking handler parses.
 ///
-/// Days are walked in the EVENT's own UTC offset (the offset carried in its RFC
-/// 3339 bounds — the zone EventKit stored it in, matching what the calendar app
-/// shows), NOT the machine's `Local` — so the dates are the event's real dates
-/// and the result is timezone-stable (the same on a laptop as in CI).
+/// All-day spans use the dates carried by their bounds. Timed spans use the
+/// start's UTC offset to split across midnight without depending on machine `Local`.
 ///
 /// `when` is `all-day    ` for an all-day event or a day the event fully fills,
 /// else the `HH:MM-HH:MM` slice inside that day. A period-straddling event may
@@ -268,6 +267,20 @@ fn day_lines(e: &EventInfo) -> Vec<(String, String)> {
         };
         vec![(date_of(&e.start).to_string(), when)]
     };
+    if e.all_day {
+        let dates = |s: &str| date_of(s).parse::<NaiveDate>().ok();
+        let (Some(start), Some(end)) = (dates(&e.start), dates(&e.end)) else {
+            return single();
+        };
+        if end <= start {
+            return single();
+        }
+        return start
+            .iter_days()
+            .take_while(|date| *date < end)
+            .map(|date| (date.to_string(), "all-day    ".to_string()))
+            .collect();
+    }
     let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
     let (Some(start), Some(end)) = (parse(&e.start), parse(&e.end)) else {
         return single();
@@ -292,7 +305,7 @@ fn day_lines(e: &EventInfo) -> Vec<(String, String)> {
         if seg_start >= seg_end {
             break;
         }
-        let when = if e.all_day || (seg_start == day_start && seg_end == day_end) {
+        let when = if seg_start == day_start && seg_end == day_end {
             "all-day    ".to_string()
         } else {
             // A slice running to the next midnight reads as `24:00`, not a
@@ -395,11 +408,25 @@ fn format_turtle(events: &[EventInfo]) -> String {
         }
         ttl.push_str(&format!(
             "\n<urn:event:{}> {} .\n",
-            e.uid.replace(['<', '>', ' '], "-"),
+            event_iri_uid(&e.uid),
             props.join(" ;\n    ")
         ));
     }
     ttl
+}
+
+/// Encode the UID within the URN's namespace-specific string. Escaping literal
+/// percent signs keeps an encoded character distinct from the same text in a UID.
+fn event_iri_uid(uid: &str) -> String {
+    let mut encoded = String::with_capacity(uid.len());
+    for b in uid.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&b) {
+            encoded.push(char::from(b));
+        } else {
+            write!(encoded, "%{b:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
 }
 
 /// A Turtle string literal (quote-and-escape). Newlines are ESCAPED, not
@@ -1384,6 +1411,32 @@ mod tests {
     }
 
     #[test]
+    fn all_day_event_does_not_block_the_end_date_at_dst_fall_back() {
+        let mut event = sample_events().remove(0);
+        event.all_day = true;
+        event.start = "2026-11-01T00:00:00-07:00".into();
+        event.end = "2026-11-02T00:00:00-08:00".into();
+        assert_eq!(
+            day_lines(&event),
+            [("2026-11-01".into(), "all-day    ".into())]
+        );
+    }
+
+    #[test]
+    fn distinct_uids_produce_distinct_valid_turtle_subjects() {
+        let mut events = sample_events();
+        events[0].uid = "slot-a".into();
+        events[1].uid = "slot a".into();
+        let mut third = events[0].clone();
+        third.uid = "slot%20a".into();
+        events.push(third);
+        let ttl = format_turtle(&events);
+        assert_eq!(ttl.matches("<urn:event:slot-a>").count(), 1);
+        assert!(ttl.contains("<urn:event:slot%20a>"));
+        assert!(ttl.contains("<urn:event:slot%2520a>"));
+    }
+
+    #[test]
     fn scope_defaults_to_the_view_and_attenuates_the_inline_override() {
         let config = CalendarConfig::from_json(
             r#"{ "view": "Brian-Busy", "sources": ["Brian", "Bosatsu"], "inbox": "Brian-New" }"#,
@@ -1468,7 +1521,7 @@ mod tests {
         let ttl = format_turtle(&sample_events());
         assert!(ttl.contains("<urn:event:ABC-123> a ical:Vevent"));
         // the UID with a space is made IRI-safe
-        assert!(ttl.contains("<urn:event:DEF-456>"));
+        assert!(ttl.contains("<urn:event:DEF%20456>"));
         // the quoted title survives escaping
         assert!(ttl.contains("ical:summary \"Dinner — \\\"Ada\\\"\""));
         assert!(ttl.contains("ik:calendar \"Bosatsu\""));
@@ -1500,7 +1553,7 @@ mod tests {
         assert!(ttl.contains("ical:attendee \"grace@example.com\""));
         // the second sample event carries none of these
         let bare = ttl
-            .split("<urn:event:DEF-456>")
+            .split("<urn:event:DEF%20456>")
             .nth(1)
             .expect("second event");
         assert!(!bare.contains("ical:description"));

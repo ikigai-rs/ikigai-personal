@@ -5,12 +5,13 @@
 //! back to a parser here.
 //!
 //! Limits: `TZID`-qualified times are read as local floating time (no tz
-//! database); `DURATION` ends are not interpreted; vCard/CardDAV is not covered.
+//! database); recurrence expansion is delegated to the server;
+//! vCard/CardDAV is not covered.
 //! Not wired to `urn:http` yet: it carries only GET/HEAD/POST/PUT/PATCH/DELETE,
 //! not PROPFIND/REPORT. Not yet exercised against a real iCloud/Fastmail/Nextcloud/Radicale server.
 
 use crate::platform::{occurrence_uid, CalendarInfo, EventInfo};
-use chrono::{Duration, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use chrono::{Days, Duration, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 
 /// One WebDAV request, ready for `urn:http`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -378,6 +379,16 @@ struct Prop {
     value: String,
 }
 
+fn unquoted(delimiter: char) -> impl FnMut(char) -> bool {
+    let mut quoted = false;
+    move |c| {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        c == delimiter && !quoted
+    }
+}
+
 fn unfold(ics: &str) -> Vec<Prop> {
     let mut lines: Vec<String> = vec![];
     for raw in ics.replace("\r\n", "\n").split('\n') {
@@ -390,9 +401,7 @@ fn unfold(ics: &str) -> Vec<Prop> {
     lines
         .into_iter()
         .filter_map(|l| {
-            let colon = l.find(':')?;
-            // Colons inside quoted params are rare; the first colon splits.
-            let (head, value) = (&l[..colon], &l[colon + 1..]);
+            let (head, value) = l.split_once(unquoted(':'))?;
             let (name, params) = head.split_once(';').unwrap_or((head, ""));
             Some(Prop {
                 name: name.to_ascii_uppercase(),
@@ -427,6 +436,77 @@ fn parse_time(p: &Prop) -> Option<(String, bool)> {
     Some((local_rfc3339(n), false))
 }
 
+/// Positive iCalendar duration split into nominal days and elapsed time.
+fn duration_parts(value: &str) -> Option<(Days, Duration)> {
+    let value = value.trim();
+    let value = value.strip_prefix('+').unwrap_or(value).strip_prefix('P')?;
+    let (days, seconds) = if let Some(weeks) = value.strip_suffix('W') {
+        (weeks.parse::<u64>().ok()?.checked_mul(7)?, 0)
+    } else {
+        let (date, time) = match value.split_once('T') {
+            Some((_, "")) => return None,
+            Some(parts) => parts,
+            None => (value, ""),
+        };
+        let days = match date.strip_suffix('D') {
+            Some(days) => days.parse::<u64>().ok()?,
+            None if date.is_empty() => 0,
+            None => return None,
+        };
+        let mut rest = time;
+        let mut seconds = 0i64;
+        for (unit, factor) in [('H', 3600), ('M', 60), ('S', 1)] {
+            if let Some((number, tail)) = rest.split_once(unit) {
+                let number = i64::try_from(number.parse::<u64>().ok()?).ok()?;
+                seconds = seconds.checked_add(number.checked_mul(factor)?)?;
+                rest = tail;
+            }
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+        (days, seconds)
+    };
+    if days == 0 && seconds == 0 {
+        return None;
+    }
+    Some((Days::new(days), Duration::try_seconds(seconds)?))
+}
+
+fn duration_end(start: &Prop, all_day: bool, value: &str) -> Option<String> {
+    let (days, seconds) = duration_parts(value)?;
+    let start = start.value.trim();
+    if all_day {
+        if value.contains('T') {
+            return None;
+        }
+        let date = NaiveDate::parse_from_str(start, "%Y%m%d").ok()?;
+        return Some(local_rfc3339(
+            date.checked_add_days(days)?.and_hms_opt(0, 0, 0)?,
+        ));
+    }
+    if let Some(utc) = start.strip_suffix('Z') {
+        let start = NaiveDateTime::parse_from_str(utc, "%Y%m%dT%H%M%S").ok()?;
+        let end = start.checked_add_days(days)?.checked_add_signed(seconds)?;
+        return Some(
+            Utc.from_utc_datetime(&end)
+                .with_timezone(&Local)
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+        );
+    }
+    // Apply nominal days in calendar time before adding elapsed hours/minutes/seconds.
+    let start = NaiveDateTime::parse_from_str(start, "%Y%m%dT%H%M%S").ok()?;
+    let end_day = start.checked_add_days(days)?;
+    if seconds.is_zero() {
+        return Some(local_rfc3339(end_day));
+    }
+    let end = Local
+        .from_local_datetime(&end_day)
+        .earliest()?
+        .checked_add_signed(seconds)?;
+    Some(end.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
 fn trigger_minutes(v: &str) -> Option<u32> {
     let rest = v.strip_prefix('-')?.strip_prefix('P')?;
     let (days, time) = match rest.split_once('T') {
@@ -457,6 +537,7 @@ pub fn parse_ics(ics: &str, calendar: &str) -> Vec<EventInfo> {
     let props = unfold(ics);
     let mut out = vec![];
     let mut cur: Option<Vec<&Prop>> = None;
+    let mut in_alarm = false;
     for p in &props {
         match (p.name.as_str(), p.value.as_str()) {
             ("BEGIN", "VEVENT") => cur = Some(vec![]),
@@ -465,11 +546,15 @@ pub fn parse_ics(ics: &str, calendar: &str) -> Vec<EventInfo> {
                     out.push(ev);
                 }
             }
-            _ => {
+            ("BEGIN", "VALARM") => in_alarm = true,
+            ("END", "VALARM") => in_alarm = false,
+            // DURATION, ATTENDEE, and other alarm fields belong to the alarm.
+            _ if !in_alarm || p.name == "TRIGGER" => {
                 if let Some(c) = cur.as_mut() {
                     c.push(p);
                 }
             }
+            _ => {}
         }
     }
     out
@@ -486,21 +571,23 @@ fn build_event(ps: &[&Prop], calendar: &str) -> Option<EventInfo> {
         return None;
     }
     let uid = val("UID")?;
-    let (start, all_day) = parse_time(get("DTSTART")?)?;
-    let end = match get("DTEND").and_then(parse_time) {
-        Some((e, _)) => e,
-        None if all_day => {
-            let d = chrono::DateTime::parse_from_rfc3339(&start)
-                .ok()?
-                .naive_local()
-                + Duration::days(1);
-            local_rfc3339(d)
-        }
-        None => start.clone(),
-    };
-    let recurring = get("RRULE").is_some() || get("RECURRENCE-ID").is_some();
-    // Alarms: only the TRIGGERs between BEGIN:VALARM … END:VALARM; the flat
-    // property list keeps order, so take TRIGGERs (VEVENT has no other).
+    let dtstart = get("DTSTART")?;
+    let (start, all_day) = parse_time(dtstart)?;
+    let end = get("DTEND")
+        .and_then(parse_time)
+        .map(|(end, _)| end)
+        .or_else(|| get("DURATION").and_then(|p| duration_end(dtstart, all_day, &p.value)))
+        .or_else(|| {
+            if all_day {
+                duration_end(dtstart, true, "P1D")
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| start.clone());
+    let recurrence_id = get("RECURRENCE-ID");
+    let recurring = get("RRULE").is_some() || recurrence_id.is_some();
+    let original_start = recurrence_id.and_then(parse_time).map(|(value, _)| value);
     let mut alerts: Vec<u32> = ps
         .iter()
         .filter(|p| p.name == "TRIGGER")
@@ -513,8 +600,9 @@ fn build_event(ps: &[&Prop], calendar: &str) -> Option<EventInfo> {
         .filter(|p| p.name == "ATTENDEE")
         .map(|p| {
             p.params
-                .split(';')
-                .find_map(|kv| kv.strip_prefix("CN="))
+                .split(unquoted(';'))
+                .filter_map(|kv| kv.split_once('='))
+                .find_map(|(key, value)| key.eq_ignore_ascii_case("CN").then_some(value))
                 .map(|cn| cn.trim_matches('"').to_string())
                 .unwrap_or_else(|| {
                     let v = p.value.as_str();
@@ -523,7 +611,7 @@ fn build_event(ps: &[&Prop], calendar: &str) -> Option<EventInfo> {
         })
         .collect();
     Some(EventInfo {
-        uid: occurrence_uid(&uid, recurring, &start),
+        uid: occurrence_uid(&uid, recurring, original_start.as_deref().unwrap_or(&start)),
         title: val("SUMMARY").unwrap_or_default(),
         calendar: calendar.to_string(),
         start,
@@ -632,6 +720,51 @@ mod tests {
         assert_eq!(ev[0].title, "Long title");
         assert_eq!(ev[0].attendees, vec!["Ann", "bob@x.org"]);
         assert_eq!(ev[0].url.as_deref(), Some("https://teams.example/j"));
+    }
+
+    #[test]
+    fn quoted_attendee_parameters_keep_colons_and_semicolons() {
+        let ics = "BEGIN:VEVENT\r\nUID:quoted\r\nDTSTART:20260701T100000Z\r\nATTENDEE;CN=\"Team: Blue; West\":mailto:team@example.test\r\nEND:VEVENT\r\n";
+        assert_eq!(
+            parse_events(&wrap(ics), "Synthetic")[0].attendees,
+            ["Team: Blue; West"]
+        );
+    }
+
+    #[test]
+    fn expanded_event_uses_duration_for_its_end() {
+        let ics = concat!(
+            "BEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID:20260701T100000Z\r\n",
+            "DTSTART:20260701T100000Z\r\nDURATION:PT1H15M30S\r\n",
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\n",
+            "TRIGGER:-PT15M\r\nDURATION:PT5M\r\nREPEAT:2\r\nEND:VALARM\r\n",
+            "END:VEVENT\r\n",
+        );
+        let events = parse_events(&wrap(ics), "Synthetic");
+        let epoch = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        assert_eq!(epoch(&events[0].end) - epoch(&events[0].start), 4530);
+        assert_eq!(events[0].alerts, [15]);
+        let instant = ics.replace("DURATION:PT1H15M30S\r\n", "");
+        let instant = parse_events(&wrap(&instant), "Synthetic").remove(0);
+        assert_eq!(instant.start, instant.end);
+    }
+
+    #[test]
+    fn all_day_duration_keeps_the_exclusive_end_date() {
+        let ics = "BEGIN:VEVENT\nUID:week\nDTSTART;VALUE=DATE:20261101\nDURATION:P1W\nEND:VEVENT\n";
+        let events = parse_events(&wrap(ics), "Synthetic");
+        assert!(events[0].all_day);
+        assert!(events[0].end.starts_with("2026-11-08T00:00:00"));
+    }
+
+    #[test]
+    fn moving_an_override_keeps_its_occurrence_uid() {
+        let ics = "BEGIN:VEVENT\nUID:series\nRECURRENCE-ID;VALUE=DATE:20260701\nDTSTART;VALUE=DATE:20260701\nEND:VEVENT\n";
+        let moved = ics.replace("DTSTART;VALUE=DATE:20260701", "DTSTART;VALUE=DATE:20260702");
+        let original = parse_events(&wrap(ics), "Synthetic");
+        let updated = parse_events(&wrap(&moved), "Synthetic");
+        assert_ne!(original[0].start, updated[0].start);
+        assert_eq!(original[0].uid, updated[0].uid);
     }
 
     #[test]
