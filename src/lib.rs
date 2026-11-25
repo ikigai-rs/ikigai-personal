@@ -207,28 +207,33 @@ fn parse_when(value: &str, name: &str) -> Result<(i64, bool)> {
 
 /// `alert=` values: space/comma-separated friendly durations (`30m`, `1h`,
 /// `1d`, or bare minutes) — minutes before start, sorted and deduplicated.
-fn parse_alert_minutes(value: &str) -> Vec<u32> {
-    let mut minutes: Vec<u32> = value
-        .split([' ', ','])
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| {
-            let (digits, factor) = match part.strip_suffix(['m', 'h', 'd']) {
-                Some(rest) => (
-                    rest,
-                    match part.chars().last() {
-                        Some('h') => 60,
-                        Some('d') => 1440,
-                        _ => 1,
-                    },
-                ),
-                None => (part, 1),
-            };
-            digits.parse::<u32>().ok().map(|n| n * factor)
-        })
-        .collect();
+fn parse_alert_minutes(value: &str) -> Result<Vec<u32>> {
+    let mut minutes = Vec::new();
+    for part in value.split([' ', ',']).filter(|part| !part.is_empty()) {
+        let (digits, factor) = match part.strip_suffix(['m', 'h', 'd']) {
+            Some(rest) => (
+                rest,
+                match part.chars().last() {
+                    Some('h') => 60,
+                    Some('d') => 1440,
+                    _ => 1,
+                },
+            ),
+            None => (part, 1),
+        };
+        let duration = digits
+            .parse::<u32>()
+            .ok()
+            .and_then(|n| n.checked_mul(factor))
+            .ok_or_else(|| Error::InvalidArgument {
+                name: "alert".to_string(),
+                detail: "expected minutes or durations such as 30m, 1h, or 1d".to_string(),
+            })?;
+        minutes.push(duration);
+    }
     minutes.sort_unstable();
     minutes.dedup();
-    minutes
+    Ok(minutes)
 }
 
 /// `HH:MM` from an RFC 3339 local timestamp (the formatting faces are compact).
@@ -492,7 +497,7 @@ fn events_for(
         .map(str::to_string)
         .unwrap_or_else(|| "week".to_string());
     let (start, end, label) = period_range(&period, Local::now().date_naive())?;
-    let calendar = scope_calendar(inv.inline_str("calendar").ok(), config)?;
+    let calendar = scope_calendar(inv.optional_str("calendar")?, config)?;
     match platform::events(start, end, calendar.as_deref()) {
         None => Ok(None),
         Some(Ok(events)) => Ok(Some((label, events))),
@@ -525,9 +530,8 @@ pub fn calendar(config: Option<CalendarConfig>) -> FnEndpoint {
         // The Turtle face carries titles — gate on detail BEFORE touching the
         // platform, so a freebusy holder never even triggers the fetch.
         let want_turtle = inv
-            .inline_str("as")
-            .map(|s| s.contains("turtle"))
-            .unwrap_or(false);
+            .optional_str("as")?
+            .is_some_and(|s| s.contains("turtle"));
         if want_turtle && !detail {
             return Err(denied(
                 "calendar (turtle carries titles)",
@@ -536,7 +540,7 @@ pub fn calendar(config: Option<CalendarConfig>) -> FnEndpoint {
         }
         // q= searches titles/locations — that IS reading detail: a freebusy
         // holder probing q= would have a title oracle, so gate it loudly.
-        let query = inv.inline_str("q").ok();
+        let query = inv.optional_str("q")?;
         if query.is_some() && !detail {
             return Err(denied(
                 "calendar (q= searches titles)",
@@ -561,9 +565,9 @@ pub fn calendar(config: Option<CalendarConfig>) -> FnEndpoint {
                 format_turtle(&events).into_bytes(),
             ));
         }
-        let label = match inv.inline_str("q") {
-            Ok(q) => format!("{label} · matching \"{q}\""),
-            Err(_) => label,
+        let label = match query {
+            Some(q) => format!("{label} · matching \"{q}\""),
+            None => label,
         };
         let body = if detail {
             format_detail(&label, &events)
@@ -745,40 +749,44 @@ fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
     if !inv.capability.allows(scope) {
         return Err(denied("calendar", scope));
     }
-    let calendar = inv.inline_str("calendar").map_err(|_| {
+    let calendar = inv.optional_str("calendar")?.ok_or_else(|| {
         Error::MissingArgument(
             "calendar (writes always address a named calendar, e.g. calendar=Brian-Busy)"
                 .to_string(),
         )
     })?;
-    // title= or the trailing content — the engine's sink grammar is
-    // "leading k=v args, the rest is content", and a multi-word title IS the
-    // natural content of an event write.
-    let title = inv
-        .inline_str("title")
-        .or_else(|_| inv.inline_str("content"))
-        .ok()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| Error::MissingArgument("title (or write it as the content)".to_string()))?;
+    // A title may also be supplied as trailing content.
+    let title = match inv.optional_str("title")? {
+        Some(title) => Some(title),
+        None => inv.optional_str("content")?,
+    }
+    .map(str::trim)
+    .filter(|t| !t.is_empty())
+    .ok_or_else(|| Error::MissingArgument("title (or write it as the content)".to_string()))?;
     let (start, start_was_date) = parse_when(inv.inline_str("start")?, "start")?;
-    let (end, _) = match inv.inline_str("end") {
-        Ok(end) => parse_when(end, "end")?,
-        // date-only start -> all-day (ends next midnight); timed -> one hour
-        Err(_) if start_was_date => (start + 86_400, true),
-        Err(_) => (start + 3_600, false),
+    let (end, _) = match inv.optional_str("end")? {
+        Some(end) => parse_when(end, "end")?,
+        None if start_was_date => (start + 86_400, true),
+        None => (start + 3_600, false),
     };
-    let all_day = start_was_date
-        || inv
-            .inline_str("all_day")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-    let location = inv.inline_str("location").ok();
-    let description = inv.inline_str("description").ok();
-    let uid = inv.inline_str("uid").ok();
+    let explicit_all_day = match inv.optional_str("all_day")? {
+        Some("true") => true,
+        Some("false") | None => false,
+        Some(_) => {
+            return Err(Error::InvalidArgument {
+                name: "all_day".to_string(),
+                detail: "expected true or false".to_string(),
+            })
+        }
+    };
+    let all_day = start_was_date || explicit_all_day;
+    let location = inv.optional_str("location")?;
+    let description = inv.optional_str("description")?;
+    let uid = inv.optional_str("uid")?;
     let alerts = inv
-        .inline_str("alert")
+        .optional_str("alert")?
         .map(parse_alert_minutes)
+        .transpose()?
         .unwrap_or_default();
     resolve(
         "calendar",
@@ -804,21 +812,22 @@ fn delete_event(inv: &Invocation<'_>) -> Result<Representation> {
     if !inv.capability.allows(scope) {
         return Err(denied("calendar", scope));
     }
-    let calendar = inv.inline_str("calendar").map_err(|_| {
+    let calendar = inv.optional_str("calendar")?.ok_or_else(|| {
         Error::MissingArgument("calendar (deletes always address a named calendar)".to_string())
     })?;
     let uid = inv
-        .inline_str("uid")
-        .map_err(|_| Error::MissingArgument("uid".to_string()))?;
-    let (window_start, window_end) =
-        match inv.inline_str("start").ok().map(|s| parse_when(s, "start")) {
-            Some(Ok((hint, _))) => (hint - 86_400, hint + 2 * 86_400),
-            Some(Err(e)) => return Err(e),
-            None => {
-                let now = Local::now().timestamp();
-                (now - 366 * 86_400, now + 2 * 366 * 86_400)
-            }
-        };
+        .optional_str("uid")?
+        .ok_or_else(|| Error::MissingArgument("uid".to_string()))?;
+    let (window_start, window_end) = match inv.optional_str("start")? {
+        Some(value) => {
+            let (hint, _) = parse_when(value, "start")?;
+            (hint - 86_400, hint + 2 * 86_400)
+        }
+        None => {
+            let now = Local::now().timestamp();
+            (now - 366 * 86_400, now + 2 * 366 * 86_400)
+        }
+    };
     resolve(
         "calendar",
         flatten(platform::delete_event(
@@ -930,9 +939,8 @@ pub fn calendars(config: Option<CalendarConfig>) -> FnEndpoint {
                     return Err(denied("calendars", scope));
                 }
                 let name = inv
-                    .inline_str("name")
+                    .optional_str("name")?
                     .map(str::to_string)
-                    .ok()
                     .or_else(|| config.as_ref().map(|c| c.view.clone()))
                     .ok_or_else(|| {
                         Error::Endpoint(
@@ -942,9 +950,8 @@ pub fn calendars(config: Option<CalendarConfig>) -> FnEndpoint {
                         )
                     })?;
                 let account = inv
-                    .inline_str("account")
+                    .optional_str("account")?
                     .map(str::to_string)
-                    .ok()
                     .or_else(|| config.as_ref().and_then(|c| c.account.clone()));
                 let made = platform::create_calendar(&name, account.as_deref());
                 resolve("calendars", flatten(made)?)
@@ -1611,10 +1618,152 @@ mod tests {
     }
 
     #[test]
+    fn invalid_optional_calendar_is_refused() {
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let request = Request::new(Verb::Source, Iri::parse("urn:personal:calendar").unwrap())
+            .with_arg("calendar", ikigai_core::ArgRef::Inline(vec![0xff]));
+        let err = block_on(kernel.issue(request, &Capability::root())).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { ref name, .. } if name == "calendar"),
+            "{err:?}"
+        );
+    }
+
+    // The unsupported backend lets these exercise argument validation without changing
+    // a real calendar. Detached invocations also cover references and content bodies
+    // before the kernel resolves inputs described by an endpoint contract.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn optional_arguments_distinguish_absent_valid_and_unreadable() {
+        use ikigai_core::{ArgRef, Bindings, ContentId, Endpoint};
+
+        type ArgumentCases = (Verb, &'static str, &'static [(&'static str, &'static str)]);
+        let cases: &[ArgumentCases] = &[
+            (
+                Verb::Source,
+                "calendar",
+                &[("as", "text/plain"), ("q", "meeting"), ("calendar", "Work")],
+            ),
+            (Verb::Source, "availability", &[("calendar", "Work")]),
+            (
+                Verb::Sink,
+                "calendar",
+                &[
+                    ("end", "2026-12-02"),
+                    ("all_day", "true"),
+                    ("location", "Office"),
+                    ("description", "Notes"),
+                    ("uid", "event-1"),
+                    ("alert", "1h"),
+                    ("title", "Title"),
+                    ("content", "Title"),
+                ],
+            ),
+            (Verb::Delete, "calendar", &[("start", "2026-12-01")]),
+            (
+                Verb::Sink,
+                "calendars",
+                &[("name", "Work"), ("account", "iCloud")],
+            ),
+        ];
+        for (verb, resource, args) in cases {
+            for (name, valid) in *args {
+                let make_request = || {
+                    let mut request = Request::new(
+                        *verb,
+                        Iri::parse(format!("urn:personal:{resource}")).unwrap(),
+                    );
+                    if *resource == "calendar" && *verb == Verb::Sink {
+                        request = request
+                            .with_arg("calendar", ArgRef::Inline(b"Work".to_vec()))
+                            .with_arg("start", ArgRef::Inline(b"2026-12-01".to_vec()));
+                        if *name != "title" && *name != "content" {
+                            request = request.with_arg("title", ArgRef::Inline(b"Title".to_vec()));
+                        } else if *name == "content" {
+                            // No title: content is the fallback.
+                        } else {
+                            request =
+                                request.with_arg("content", ArgRef::Inline(b"Title".to_vec()));
+                        }
+                    } else if *resource == "calendar" && *verb == Verb::Delete {
+                        request = request
+                            .with_arg("calendar", ArgRef::Inline(b"Work".to_vec()))
+                            .with_arg("uid", ArgRef::Inline(b"event-1".to_vec()));
+                    }
+                    request
+                };
+                let endpoint = match *resource {
+                    "calendar" => calendar(None),
+                    "availability" => availability(None),
+                    _ => calendars(Some(CalendarConfig {
+                        view: "Work".into(),
+                        sources: vec![],
+                        inbox: None,
+                        account: None,
+                    })),
+                };
+                let bindings = Bindings::new();
+                let capability = Capability::root();
+                let invoke = |request: &Request| {
+                    let inv = Invocation::detached(request, &bindings, &capability);
+                    block_on(endpoint.invoke(&inv))
+                };
+                // For content, absence correctly reports the missing title.
+                let absent = invoke(&make_request());
+                assert!(
+                    !matches!(absent, Err(Error::InvalidArgument { .. })),
+                    "{resource} {verb:?} {name}: {absent:?}"
+                );
+                let present = invoke(
+                    &make_request().with_arg(*name, ArgRef::Inline(valid.as_bytes().to_vec())),
+                );
+                assert!(
+                    !matches!(present, Err(Error::InvalidArgument { .. })),
+                    "{resource} {verb:?} {name}: {present:?}"
+                );
+                for bad in [
+                    ArgRef::Inline(vec![0xff]),
+                    ArgRef::Reference(Iri::parse("urn:example:value").unwrap()),
+                    ArgRef::Content(ContentId::of(b"body")),
+                ] {
+                    let error = invoke(&make_request().with_arg(*name, bad)).unwrap_err();
+                    assert!(
+                        matches!(error, Error::InvalidArgument { name: ref n, ref detail } if n == name && !detail.is_empty()),
+                        "{resource} {verb:?} {name}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn malformed_optional_event_values_are_refused() {
+        let kernel = Kernel::new(Arc::new(space(None)));
+        for (name, value) in [
+            ("end", "tomorrowish"),
+            ("all_day", "yes"),
+            ("alert", "1h junk"),
+            ("alert", "4294967295d"),
+        ] {
+            let request = Request::new(Verb::Sink, Iri::parse("urn:personal:calendar").unwrap())
+                .with_arg("calendar", ikigai_core::ArgRef::Inline(b"Work".to_vec()))
+                .with_arg("title", ikigai_core::ArgRef::Inline(b"Title".to_vec()))
+                .with_arg("start", ikigai_core::ArgRef::Inline(b"2026-12-01".to_vec()))
+                .with_arg(name, ikigai_core::ArgRef::Inline(value.as_bytes().to_vec()));
+            let error = block_on(kernel.issue(request, &Capability::root())).unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidArgument { name: ref n, .. } if n == name),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn alert_durations_parse() {
-        assert_eq!(parse_alert_minutes("1h 1d"), vec![60, 1440]);
-        assert_eq!(parse_alert_minutes("30m,15"), vec![15, 30]);
-        assert_eq!(parse_alert_minutes("junk"), Vec::<u32>::new());
+        assert_eq!(parse_alert_minutes("1h 1d").unwrap(), vec![60, 1440]);
+        assert_eq!(parse_alert_minutes("30m,15").unwrap(), vec![15, 30]);
+        assert!(parse_alert_minutes("junk").is_err());
     }
 
     #[test]
