@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-personal"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Personal contexts for ikigai — OS-backed resources (contacts, calendar, availability) under urn:personal:*. macOS-first; Windows and Linux build but report unsupported for now."
@@ -12,9 +12,8 @@ keywords = ["ikigai", "roc", "personal", "calendar", "contacts"]
 categories = ["os"]
 
 [dependencies]
-# Core 0.4.0 (scope opacity, structured denials; the cascade): the public API
-# now uses core 0.4 types.
-ikigai-core = "0.4.0" # ActionSpec (per-verb contracts)
+# Core 0.4.3 provides optional argument readers.
+ikigai-core = "0.4.3" # ActionSpec (per-verb contracts)
 ikigai-http = "0.8.0" # auth::basic — the shared Authorization helper
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
