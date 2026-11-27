@@ -53,6 +53,15 @@ pub fn delete_event(
     None
 }
 
+pub fn put_event(
+    _calendar: &str,
+    _uid: &str,
+    _event: &crate::store::EventWrite<'_>,
+    _now: i64,
+) -> Option<Result<crate::store::PutOutcome, String>> {
+    None
+}
+
 pub fn observe_store(_on_change: Box<dyn Fn() + Send>) -> Option<()> {
     None
 }

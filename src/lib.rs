@@ -26,6 +26,7 @@
 
 pub mod caldav;
 mod platform;
+pub mod store;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 use ikigai_core::{
@@ -742,13 +743,34 @@ pub fn calendar(config: Option<CalendarConfig>) -> FnEndpoint {
     )
 }
 
-/// `Sink urn:personal:calendar` — create an event in a NAMED calendar (the
-/// materialized-view apply path). Args are validated before any platform call.
-fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
-    let scope = "urn:cap:personal:calendar:write";
-    if !inv.capability.allows(scope) {
-        return Err(denied("calendar", scope));
+/// The arguments a write states about one event, read and checked before any
+/// platform call. Shared by the create Sink and the put-by-uid Sink.
+struct EventArgs<'a> {
+    calendar: &'a str,
+    title: &'a str,
+    start: i64,
+    end: i64,
+    all_day: bool,
+    location: Option<&'a str>,
+    description: Option<&'a str>,
+    alerts: Vec<u32>,
+}
+
+impl EventArgs<'_> {
+    fn write(&self) -> store::EventWrite<'_> {
+        store::EventWrite {
+            title: self.title,
+            start: self.start,
+            end: self.end,
+            all_day: self.all_day,
+            location: self.location,
+            description: self.description,
+            alerts: &self.alerts,
+        }
     }
+}
+
+fn event_args<'a>(inv: &'a Invocation<'_>) -> Result<EventArgs<'a>> {
     let calendar = inv.optional_str("calendar")?.ok_or_else(|| {
         Error::MissingArgument(
             "calendar (writes always address a named calendar, e.g. calendar=Brian-Busy)"
@@ -779,29 +801,57 @@ fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
             })
         }
     };
-    let all_day = start_was_date || explicit_all_day;
-    let location = inv.optional_str("location")?;
-    let description = inv.optional_str("description")?;
-    let uid = inv.optional_str("uid")?;
     let alerts = inv
         .optional_str("alert")?
         .map(parse_alert_minutes)
         .transpose()?
         .unwrap_or_default();
+    Ok(EventArgs {
+        calendar,
+        title,
+        start,
+        end,
+        all_day: start_was_date || explicit_all_day,
+        location: inv.optional_str("location")?,
+        description: inv.optional_str("description")?,
+        alerts,
+    })
+}
+
+/// `Sink urn:personal:calendar` — create an event in a NAMED calendar (the
+/// materialized-view apply path). Args are validated before any platform call.
+/// It always makes a new event; to update in place by uid, Sink to
+/// `urn:personal:calendar:event:uid:{uid}` instead.
+fn create_event(inv: &Invocation<'_>) -> Result<Representation> {
+    let scope = "urn:cap:personal:calendar:write";
+    if !inv.capability.allows(scope) {
+        return Err(denied("calendar", scope));
+    }
+    let args = event_args(inv)?;
+    let uid = inv.optional_str("uid")?;
     resolve(
         "calendar",
         flatten(platform::create_event(
-            calendar,
-            title,
-            start,
-            end,
-            all_day,
-            location,
-            description,
+            args.calendar,
+            args.title,
+            args.start,
+            args.end,
+            args.all_day,
+            args.location,
+            args.description,
             uid,
-            &alerts,
+            &args.alerts,
         ))?,
     )
+}
+
+/// The search window for a delete: near the `start=` hint when one is given,
+/// else the wide window around now.
+fn delete_window(inv: &Invocation<'_>) -> Result<(i64, i64)> {
+    Ok(match inv.optional_str("start")? {
+        Some(value) => store::near(parse_when(value, "start")?.0),
+        None => store::wide(Local::now().timestamp()),
+    })
 }
 
 /// `Delete urn:personal:calendar` — remove the event with `uid=` from a NAMED
@@ -818,16 +868,7 @@ fn delete_event(inv: &Invocation<'_>) -> Result<Representation> {
     let uid = inv
         .optional_str("uid")?
         .ok_or_else(|| Error::MissingArgument("uid".to_string()))?;
-    let (window_start, window_end) = match inv.optional_str("start")? {
-        Some(value) => {
-            let (hint, _) = parse_when(value, "start")?;
-            (hint - 86_400, hint + 2 * 86_400)
-        }
-        None => {
-            let now = Local::now().timestamp();
-            (now - 366 * 86_400, now + 2 * 366 * 86_400)
-        }
-    };
+    let (window_start, window_end) = delete_window(inv)?;
     resolve(
         "calendar",
         flatten(platform::delete_event(
@@ -836,6 +877,162 @@ fn delete_event(inv: &Invocation<'_>) -> Result<Representation> {
             window_start,
             window_end,
         ))?,
+    )
+}
+
+/// The uid captured from `urn:personal:calendar:event:uid:{uid}`, percent-decoded:
+/// the same encoding the Turtle face writes into `urn:event:{uid}` subjects.
+fn bound_uid(inv: &Invocation<'_>) -> Result<String> {
+    let raw = inv
+        .bindings
+        .get("uid")
+        .ok_or_else(|| Error::MissingArgument("uid".to_string()))?;
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|uid| uid.into_owned())
+        .map_err(|_| Error::InvalidArgument {
+            name: "uid".to_string(),
+            detail: "the percent-decoded uid is not UTF-8".to_string(),
+        })
+}
+
+/// `urn:personal:calendar:event:uid:{uid}` — one event, named by the stable uid a
+/// system of record gave it (a class session, an org heading). **Sink** puts it
+/// into a named calendar: the event carrying that uid is updated in place (a moved
+/// session moves its entry), or made when the calendar does not hold it. A put
+/// states the whole event, so an absent location, description or alert clears the
+/// stored one. **Delete** removes it. Read events through `urn:personal:calendar`.
+pub fn calendar_event() -> FnEndpoint {
+    FnEndpoint::new("calendar-event", |inv: &Invocation<'_>| {
+        let scope = "urn:cap:personal:calendar:write";
+        match inv.request.verb {
+            Verb::Sink => {
+                if !inv.capability.allows(scope) {
+                    return Err(denied("calendar:event", scope));
+                }
+                let uid = bound_uid(inv)?;
+                let args = event_args(inv)?;
+                let outcome = platform::put_event(
+                    args.calendar,
+                    &uid,
+                    &args.write(),
+                    Local::now().timestamp(),
+                )
+                .map(|r| r.map(|o| store::confirmation(o, args.title, args.calendar)));
+                resolve("calendar:event", flatten(outcome)?)
+            }
+            Verb::Delete => {
+                if !inv.capability.allows(scope) {
+                    return Err(denied("calendar:event", scope));
+                }
+                let uid = bound_uid(inv)?;
+                let calendar = inv.optional_str("calendar")?.ok_or_else(|| {
+                    Error::MissingArgument(
+                        "calendar (deletes always address a named calendar)".to_string(),
+                    )
+                })?;
+                let (window_start, window_end) = delete_window(inv)?;
+                resolve(
+                    "calendar:event",
+                    flatten(platform::delete_event(
+                        calendar,
+                        &uid,
+                        window_start,
+                        window_end,
+                    ))?,
+                )
+            }
+            _ => Err(Error::Endpoint(
+                "urn:personal:calendar:event:uid:{uid} takes Sink (put the event) or Delete; \
+                 read events through urn:personal:calendar"
+                    .to_string(),
+            )),
+        }
+    })
+    .with_description(
+        Description::new("calendar-event")
+            .title("Calendar event by uid")
+            .summary(
+                "One event named by its stable uid (urn:personal:calendar:event:uid:{uid}, \
+                 percent-encoded). Sink puts it into a named calendar: updated in place when \
+                 the calendar holds that uid, so a moved session moves its entry, else \
+                 created. A put states the whole event. Delete removes it.",
+            )
+            .verb(Verb::Sink)
+            .verb(Verb::Delete)
+            .verb(Verb::Meta)
+            .output("text/plain;charset=utf-8")
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("put the event: update in place by uid, or create")
+                    .requires("urn:cap:personal:calendar:write")
+                    .input(
+                        ArgSpec::new("uid")
+                            .summary("the event's stable uid, captured from the IRI")
+                            .binding(),
+                    )
+                    .input(ArgSpec::new("calendar").summary("the target calendar"))
+                    .input(
+                        ArgSpec::new("start")
+                            .summary("RFC 3339, or YYYY-MM-DD for all-day")
+                            .class("http://www.w3.org/2001/XMLSchema#dateTime"),
+                    )
+                    .input(
+                        ArgSpec::new("title")
+                            .summary("the event title (default: the piped content)")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("content")
+                            .summary("the title, when title= is absent")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("end")
+                            .summary("RFC 3339 (default: +1h, or all-day for a date start)")
+                            .class("http://www.w3.org/2001/XMLSchema#dateTime")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("location")
+                            .summary("absent clears the stored location")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("description")
+                            .summary("absent clears the stored notes")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("all_day")
+                            .class("http://www.w3.org/2001/XMLSchema#boolean")
+                            .optional(),
+                    )
+                    .input(
+                        ArgSpec::new("alert")
+                            .summary("alarms before start; absent clears the stored ones")
+                            .optional(),
+                    )
+                    .output("text/plain;charset=utf-8"),
+            )
+            .action(
+                ActionSpec::new(Verb::Delete)
+                    .summary("delete the event carrying this uid")
+                    .requires("urn:cap:personal:calendar:write")
+                    .input(
+                        ArgSpec::new("uid")
+                            .summary("the event's stable uid, captured from the IRI")
+                            .binding(),
+                    )
+                    .input(ArgSpec::new("calendar").summary("the target calendar"))
+                    .input(
+                        ArgSpec::new("start")
+                            .summary("window hint for the occurrence search")
+                            .class("http://www.w3.org/2001/XMLSchema#dateTime")
+                            .optional(),
+                    )
+                    .output("text/plain;charset=utf-8"),
+            ),
     )
 }
 
@@ -1092,6 +1289,12 @@ pub fn space(config: Option<CalendarConfig>) -> EndpointSpace {
         .bind(
             Exact::new("urn:personal:calendar:config"),
             calendar_config(config.clone()),
+        )
+        // BEFORE the period grammar, which would otherwise capture `event:uid:…`
+        // as a period (first grammar match wins, and a final variable takes the rest).
+        .bind(
+            UriTemplate::parse("urn:personal:calendar:event:uid:{uid}").expect("valid template"),
+            calendar_event(),
         )
         // AFTER the exact binds: the period grammar must not shadow
         // urn:personal:calendar:config (first grammar match wins).
@@ -1852,6 +2055,146 @@ mod tests {
             &freebusy,
         ));
         assert!(format!("{:?}", denied.unwrap_err()).contains("unknown period"));
+    }
+
+    fn issue(
+        verb: Verb,
+        iri: &str,
+        args: &[(&str, &[u8])],
+        capability: &Capability,
+    ) -> Result<Representation> {
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let mut request = Request::new(verb, Iri::parse(iri).unwrap());
+        for (name, value) in args {
+            request = request.with_arg(*name, ikigai_core::ArgRef::Inline(value.to_vec()));
+        }
+        block_on(kernel.issue(request, capability))
+    }
+
+    #[test]
+    fn the_event_resource_is_not_read_as_a_period() {
+        // Bound before urn:personal:calendar:{period}: a write to an event by uid
+        // reaches the event endpoint (which asks for its calendar), never the period
+        // grammar (which would answer "unknown period").
+        let err = issue(
+            Verb::Sink,
+            "urn:personal:calendar:event:uid:session-3",
+            &[("title", b"Session 3")],
+            &Capability::root(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(matches!(err, Error::MissingArgument(_)), "{msg}");
+        assert!(msg.contains("calendar"), "{msg}");
+        assert!(!msg.contains("unknown period"), "{msg}");
+    }
+
+    #[test]
+    fn putting_an_event_by_uid_requires_the_write_capability() {
+        let freebusy =
+            Capability::root().attenuate(["urn:cap:personal:calendar:read:freebusy".to_string()]);
+        for verb in [Verb::Sink, Verb::Delete] {
+            let err = issue(
+                verb,
+                "urn:personal:calendar:event:uid:session-3",
+                &[("calendar", b"Teaching")],
+                &freebusy,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Denied(_)), "{verb:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn the_event_resource_offers_put_and_delete_only_to_a_writer() {
+        let kernel = Kernel::new(Arc::new(space(None)));
+        let manifold = |capability: &Capability| {
+            let request = Request::new(Verb::Source, Iri::parse("urn:kernel:actions").unwrap())
+                .with_arg("as", ikigai_core::ArgRef::Inline(b"text/turtle".to_vec()));
+            String::from_utf8(block_on(kernel.issue(request, capability)).unwrap().bytes).unwrap()
+        };
+        let all = manifold(&Capability::root());
+        assert!(
+            all.contains("urn:personal:calendar:event:uid:{uid}"),
+            "the event resource is in the manifold: {all}"
+        );
+        let freebusy = manifold(&Capability::scoped([
+            "urn:cap:kernel:inspect",
+            "urn:cap:personal:calendar:read:freebusy",
+        ]));
+        assert!(
+            !freebusy.contains("urn:personal:calendar:event:uid:{uid}"),
+            "a freebusy capability is not offered the writes: {freebusy}"
+        );
+    }
+
+    #[test]
+    fn a_uid_that_does_not_decode_to_utf8_is_refused() {
+        let err = issue(
+            Verb::Sink,
+            "urn:personal:calendar:event:uid:bad%FFuid",
+            &[
+                ("calendar", b"Teaching"),
+                ("title", b"T"),
+                ("start", b"2026-12-01"),
+            ],
+            &Capability::root(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { ref name, .. } if name == "uid"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_event_resource_points_reads_at_the_calendar() {
+        let err = issue(
+            Verb::Source,
+            "urn:personal:calendar:event:uid:session-3",
+            &[],
+            &Capability::root(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("read events through urn:personal:calendar"));
+    }
+
+    #[test]
+    fn a_put_rejects_malformed_times_before_any_platform_call() {
+        let err = issue(
+            Verb::Sink,
+            "urn:personal:calendar:event:uid:session-3",
+            &[
+                ("calendar", b"Teaching"),
+                ("title", b"T"),
+                ("start", b"teatime"),
+            ],
+            &Capability::root(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument { ref name, .. } if name == "start"),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_valid_put_reaches_the_platform_with_the_decoded_uid() {
+        // Off macOS the platform has no backend: a valid put passes every check and
+        // reports unsupported, which proves validation and decoding let it through.
+        let err = issue(
+            Verb::Sink,
+            "urn:personal:calendar:event:uid:session%203",
+            &[
+                ("calendar", b"Teaching"),
+                ("title", b"T"),
+                ("start", b"2026-12-01T10:00:00Z"),
+            ],
+            &Capability::root(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("not supported"), "{err:?}");
     }
 
     #[cfg(not(target_os = "macos"))]

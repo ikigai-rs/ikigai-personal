@@ -8,6 +8,7 @@ macOS: reads, writes, and calendar management, capability-projected throughout.
 | resource | verbs | what it is |
 |----------|-------|------------|
 | `urn:personal:calendar[:{period}]` | Source, Sink, Delete | events for a period; **write** events into a named calendar; **delete** by identity |
+| `urn:personal:calendar:event:uid:{uid}` | Sink, Delete | one event by its stable uid: **put** it into a named calendar (update in place, or create), **delete** it |
 | `urn:personal:availability[:{period}]` | Source | the free/busy projection — busy blocks only, no detail |
 | `urn:personal:calendars` | Source, Sink | the calendar collection: list every calendar with its account; **create** one |
 | `urn:personal:calendar:config` | Source | the consolidated-view configuration the host loaded |
@@ -56,6 +57,30 @@ a `uid=` which is stamped on the event's URL as `urn:event:{uid}`, and reads
 record reads back as the *same subject*, making derivation passes idempotent
 and duplicate-free.
 
+## Updating an event in place by uid
+
+A system of record that owns its events (a class schedule, an org file) writes
+each one to `urn:personal:calendar:event:uid:{uid}`, where `{uid}` is its own
+stable id, percent-encoded. The Sink **puts** the event: when the named calendar
+holds an event carrying that uid, it is rewritten in place, so a moved session
+moves its entry instead of leaving a second copy; otherwise it is created.
+Delete removes it.
+
+```text
+sink   urn:personal:calendar:event:uid:session-3 calendar=Teaching start=2026-12-03T10:00:00-08:00 end=2026-12-03T11:00:00-08:00 alert=15m "Session 3"
+delete urn:personal:calendar:event:uid:session-3 calendar=Teaching
+```
+
+- A put states the WHOLE event: an absent `location=`, `description=` or
+  `alert=` clears the stored one. The event's URL keeps the identity it carries.
+- The answer says which happened: `created "…" in Teaching`, `updated "…" in
+  Teaching`, or `updated "…" in Teaching: moved to its new time`.
+- The search looks a day either side of the new start first, then from a year
+  back to two years ahead. An event moved further than that is not found, and a
+  second copy is made.
+- `Sink urn:personal:calendar` with `uid=` still always CREATES, as before; the
+  derivation pass deletes before it recreates, and keeps that contract.
+
 ## Alarms
 
 Writes accept `alert=` — friendly space/comma-separated tokens (`1h 1d`,
@@ -87,7 +112,9 @@ calendar on the configured account.
 | **Windows / Linux** | placeholders — build cleanly, resolve to a clear "not supported yet" error |
 
 Adding a backend means filling in one file under `src/platform/` — the seam and
-the rest of the crate don't change. Note macOS TCC attribution follows the
+the rest of the crate don't change. The put-by-uid decision is platform-neutral (`src/store.rs`) and tested against
+an in-memory store; only the EventKit calls behind it need a real calendar.
+Note macOS TCC attribution follows the
 *hosting* process: terminal-launched processes prompt normally; a non-bundled
 binary under another app's ancestry may be silently denied.
 
