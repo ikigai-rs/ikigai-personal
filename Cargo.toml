@@ -15,6 +15,9 @@ categories = ["os"]
 # Core 0.4.3 provides optional argument readers.
 ikigai-core = "0.4.3" # ActionSpec (per-verb contracts)
 ikigai-http = "0.8.0" # auth::basic — the shared Authorization helper
+# Decodes the uid captured from urn:personal:calendar:event:uid:{uid}; already in the
+# graph through url.
+percent-encoding = "2.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Local-time period math (today/week/month partitions). Clock only — no parsing

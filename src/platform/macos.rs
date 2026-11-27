@@ -459,10 +459,35 @@ fn delete_event_impl(
     window_end: i64,
 ) -> Result<String, String> {
     use objc2_event_kit::EKSpan;
-    use objc2_foundation::{NSArray, NSDate};
 
     let store = store()?;
     let target = calendar_named(&store, calendar)?;
+    let Some(event) = find_in(&store, target, uid, window_start, window_end) else {
+        return Err(format!(
+            "no event with uid {uid} in {calendar} within the window"
+        ));
+    };
+    let title = unsafe { event.title() }.to_string();
+    unsafe {
+        store
+            .removeEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+            .map_err(|e| format!("removing event failed: {e}"))?;
+    }
+    Ok(format!("removed \"{title}\" from {calendar}"))
+}
+
+/// The first event in `target` within `[window_start, window_end)` carrying `uid`:
+/// the URL-carried source identity (`urn:event:{uid}`, stamped by this crate's
+/// writes) or the occurrence-qualified store uid.
+fn find_in(
+    store: &EKEventStore,
+    target: Retained<EKCalendar>,
+    uid: &str,
+    window_start: i64,
+    window_end: i64,
+) -> Option<Retained<objc2_event_kit::EKEvent>> {
+    use objc2_foundation::{NSArray, NSDate};
+
     let cals = NSArray::from_retained_slice(&[target]);
     let predicate = unsafe {
         store.predicateForEventsWithStartDate_endDate_calendars(
@@ -472,31 +497,120 @@ fn delete_event_impl(
         )
     };
     let found = unsafe { store.eventsMatchingPredicate(&predicate) };
-    for i in 0..found.count() {
-        let event = found.objectAtIndex(i);
-        let url_uid = unsafe { event.URL() }
-            .and_then(|u| u.absoluteString())
-            .map(|s| s.to_string())
-            .and_then(|u| u.strip_prefix("urn:event:").map(str::to_string));
-        let store_uid = unsafe { event.calendarItemExternalIdentifier() }
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| unsafe { event.calendarItemIdentifier() }.to_string());
-        let start = rfc3339_local(unsafe { event.startDate().timeIntervalSince1970() });
-        let occurrence =
-            super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start);
-        if url_uid.as_deref() == Some(uid) || occurrence == uid {
-            let title = unsafe { event.title() }.to_string();
-            unsafe {
-                store
-                    .removeEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                    .map_err(|e| format!("removing event failed: {e}"))?;
+    (0..found.count())
+        .map(|i| found.objectAtIndex(i))
+        .find(|event| {
+            let url_uid = unsafe { event.URL() }
+                .and_then(|u| u.absoluteString())
+                .map(|s| s.to_string())
+                .and_then(|u| u.strip_prefix("urn:event:").map(str::to_string));
+            if url_uid.as_deref() == Some(uid) {
+                return true;
             }
-            return Ok(format!("removed \"{title}\" from {calendar}"));
-        }
+            let store_uid = unsafe { event.calendarItemExternalIdentifier() }
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| unsafe { event.calendarItemIdentifier() }.to_string());
+            let start = rfc3339_local(unsafe { event.startDate().timeIntervalSince1970() });
+            super::occurrence_uid(&store_uid, unsafe { event.hasRecurrenceRules() }, &start) == uid
+        })
+}
+
+/// Put an event by its stable uid into a named calendar: update in place when the
+/// calendar holds it, create it otherwise. The decision is
+/// [`crate::store::put_event`]; this is EventKit's side of the seam.
+pub fn put_event(
+    calendar: &str,
+    uid: &str,
+    event: &crate::store::EventWrite<'_>,
+    now: i64,
+) -> Option<Result<crate::store::PutOutcome, String>> {
+    Some(store().and_then(|store| {
+        crate::store::put_event(&mut EkStore { store }, calendar, uid, event, now)
+    }))
+}
+
+/// The EventKit store behind [`crate::store::EventStore`].
+struct EkStore {
+    store: Retained<EKEventStore>,
+}
+
+impl crate::store::EventStore for EkStore {
+    type Handle = Retained<objc2_event_kit::EKEvent>;
+
+    fn find(
+        &mut self,
+        calendar: &str,
+        uid: &str,
+        window_start: i64,
+        window_end: i64,
+    ) -> Result<Option<crate::store::Found<Self::Handle>>, String> {
+        let target = calendar_named(&self.store, calendar)?;
+        Ok(
+            find_in(&self.store, target, uid, window_start, window_end).map(|event| {
+                let start = unsafe { event.startDate().timeIntervalSince1970() } as i64;
+                let end = unsafe { event.endDate().timeIntervalSince1970() } as i64;
+                crate::store::Found {
+                    handle: event,
+                    start,
+                    end,
+                }
+            }),
+        )
     }
-    Err(format!(
-        "no event with uid {uid} in {calendar} within the window"
-    ))
+
+    fn create(
+        &mut self,
+        calendar: &str,
+        uid: &str,
+        event: &crate::store::EventWrite<'_>,
+    ) -> Result<(), String> {
+        create_event_impl(
+            calendar,
+            event.title,
+            event.start,
+            event.end,
+            event.all_day,
+            event.location,
+            event.description,
+            Some(uid),
+            event.alerts,
+        )
+        .map(drop)
+    }
+
+    fn update(
+        &mut self,
+        handle: Self::Handle,
+        event: &crate::store::EventWrite<'_>,
+    ) -> Result<(), String> {
+        use objc2_event_kit::{EKAlarm, EKSpan};
+        use objc2_foundation::NSDate;
+
+        unsafe {
+            handle.setTitle(Some(&NSString::from_str(event.title)));
+            handle.setStartDate(Some(&NSDate::dateWithTimeIntervalSince1970(
+                event.start as f64,
+            )));
+            handle.setEndDate(Some(&NSDate::dateWithTimeIntervalSince1970(
+                event.end as f64,
+            )));
+            handle.setAllDay(event.all_day);
+            // A put states the whole event: what it leaves out is cleared.
+            handle.setLocation(event.location.map(NSString::from_str).as_deref());
+            handle.setNotes(event.description.map(NSString::from_str).as_deref());
+            handle.setAlarms(None);
+            for minutes in event.alerts {
+                let alarm = EKAlarm::alarmWithRelativeOffset(-(f64::from(*minutes) * 60.0));
+                handle.addAlarm(&alarm);
+            }
+            // The URL keeps whatever identity it carried: this crate's
+            // urn:event:{uid} token, or a native event's real link.
+            self.store
+                .saveEvent_span_commit_error(&handle, EKSpan::ThisEvent, true)
+                .map_err(|e| format!("saving event failed: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Run `on_change` whenever the event store reports ANY change — an edit in
