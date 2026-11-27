@@ -26,12 +26,13 @@
 
 pub mod caldav;
 mod platform;
+pub mod remote;
 pub mod store;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 use ikigai_core::{
-    ActionSpec, ArgSpec, Description, EndpointSpace, Error, Exact, FnEndpoint, Invocation,
-    ReprType, Representation, Result, UriTemplate, Verb,
+    ActionSpec, ArgSpec, AsyncFnEndpoint, Description, EndpointSpace, Error, Exact, FnEndpoint,
+    Invocation, ReprType, Representation, Result, UriTemplate, Verb,
 };
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -902,176 +903,278 @@ fn bound_uid(inv: &Invocation<'_>) -> Result<String> {
 /// session moves its entry), or made when the calendar does not hold it. A put
 /// states the whole event, so an absent location, description or alert clears the
 /// stored one. **Delete** removes it. Read events through `urn:personal:calendar`.
-pub fn calendar_event() -> FnEndpoint {
-    FnEndpoint::new("calendar-event", |inv: &Invocation<'_>| {
-        let scope = "urn:cap:personal:calendar:write";
-        match inv.request.verb {
-            Verb::Sink => {
-                if !inv.capability.allows(scope) {
-                    return Err(denied("calendar:event", scope));
-                }
-                let uid = bound_uid(inv)?;
-                let args = event_args(inv)?;
-                let outcome = platform::put_event(
-                    args.calendar,
-                    &uid,
-                    &args.write(),
-                    Local::now().timestamp(),
-                )
-                .map(|r| r.map(|o| store::confirmation(o, args.title, args.calendar)));
-                resolve("calendar:event", flatten(outcome)?)
+pub fn calendar_event(config: Option<CalendarConfig>) -> AsyncFnEndpoint {
+    let caldav = remote_of(config.as_ref()).and_then(|r| r.caldav.clone());
+    let described = calendar_event_description(caldav.is_some());
+    let caldav = std::sync::Arc::new(caldav);
+    AsyncFnEndpoint::new("calendar-event", move |inv: &Invocation<'_>| {
+        let caldav = caldav.clone();
+        Box::pin(async move {
+            let scope = "urn:cap:personal:calendar:write";
+            if matches!(inv.request.verb, Verb::Sink | Verb::Delete)
+                && !inv.capability.allows(scope)
+            {
+                return Err(denied("calendar:event", scope));
             }
-            Verb::Delete => {
-                if !inv.capability.allows(scope) {
-                    return Err(denied("calendar:event", scope));
+            match inv.request.verb {
+                Verb::Sink => {
+                    let uid = bound_uid(inv)?;
+                    let args = event_args(inv)?;
+                    let outcome = match remote_target(caldav.as_ref().as_ref(), args.calendar)? {
+                        Some(dav) => Some(Ok(remote::put(inv, dav, &uid, &args.write()).await?)),
+                        None => platform::put_event(
+                            args.calendar,
+                            &uid,
+                            &args.write(),
+                            Local::now().timestamp(),
+                        ),
+                    }
+                    .map(|r| r.map(|o| store::confirmation(o, args.title, args.calendar)));
+                    resolve("calendar:event", flatten(outcome)?)
                 }
-                let uid = bound_uid(inv)?;
-                let calendar = inv.optional_str("calendar")?.ok_or_else(|| {
-                    Error::MissingArgument(
-                        "calendar (deletes always address a named calendar)".to_string(),
+                Verb::Delete => {
+                    let uid = bound_uid(inv)?;
+                    let calendar = inv.optional_str("calendar")?.ok_or_else(|| {
+                        Error::MissingArgument(
+                            "calendar (deletes always address a named calendar)".to_string(),
+                        )
+                    })?;
+                    let (window_start, window_end) = delete_window(inv)?;
+                    if let Some(dav) = remote_target(caldav.as_ref().as_ref(), calendar)? {
+                        return resolve(
+                            "calendar:event",
+                            Some(remote::delete(inv, dav, &uid).await?),
+                        );
+                    }
+                    resolve(
+                        "calendar:event",
+                        flatten(platform::delete_event(
+                            calendar,
+                            &uid,
+                            window_start,
+                            window_end,
+                        ))?,
                     )
-                })?;
-                let (window_start, window_end) = delete_window(inv)?;
-                resolve(
-                    "calendar:event",
-                    flatten(platform::delete_event(
-                        calendar,
-                        &uid,
-                        window_start,
-                        window_end,
-                    ))?,
-                )
+                }
+                _ => Err(Error::Endpoint(
+                    "urn:personal:calendar:event:uid:{uid} takes Sink (put the event) or Delete; \
+                     read events through urn:personal:calendar"
+                        .to_string(),
+                )),
             }
-            _ => Err(Error::Endpoint(
-                "urn:personal:calendar:event:uid:{uid} takes Sink (put the event) or Delete; \
-                 read events through urn:personal:calendar"
-                    .to_string(),
-            )),
-        }
+        })
     })
-    .with_description(
-        Description::new("calendar-event")
-            .title("Calendar event by uid")
-            .summary(
-                "One event named by its stable uid (urn:personal:calendar:event:uid:{uid}, \
+    .with_description(described)
+}
+
+/// The CalDAV calendar a write goes to: the configured one when `calendar=` names
+/// it. On a host without a platform store, naming any other calendar is refused
+/// with the name that would work, rather than "not supported".
+fn remote_target<'c>(
+    caldav: Option<&'c remote::CaldavConfig>,
+    calendar: &str,
+) -> Result<Option<&'c remote::CaldavConfig>> {
+    let Some(dav) = caldav else {
+        return Ok(None);
+    };
+    if dav.calendar.trim().eq_ignore_ascii_case(calendar.trim()) {
+        return Ok(Some(dav));
+    }
+    if platform::SUPPORTED {
+        return Ok(None);
+    }
+    Err(Error::InvalidArgument {
+        name: "calendar".to_string(),
+        detail: format!(
+            "this host writes only to its CalDAV calendar {:?}; calendar={calendar:?} is not it",
+            dav.calendar
+        ),
+    })
+}
+
+/// The event resource's contract. With a CalDAV calendar configured, both writes
+/// also need its secrets, the network and the cut authority `urn:http`'s writes
+/// require, so the manifold offers them only to a caller who can finish one.
+fn calendar_event_description(caldav: bool) -> Description {
+    let needs = |mut action: ActionSpec| {
+        if caldav {
+            for scope in REMOTE_READ_REQUIRES {
+                action = action.requires(scope);
+            }
+            action = action.requires("urn:cap:kernel:cut");
+        }
+        action
+    };
+    Description::new("calendar-event")
+        .title("Calendar event by uid")
+        .summary(
+            "One event named by its stable uid (urn:personal:calendar:event:uid:{uid}, \
                  percent-encoded). Sink puts it into a named calendar: updated in place when \
                  the calendar holds that uid, so a moved session moves its entry, else \
                  created. A put states the whole event. Delete removes it.",
-            )
-            .verb(Verb::Sink)
-            .verb(Verb::Delete)
-            .verb(Verb::Meta)
-            .output("text/plain;charset=utf-8")
-            .action(
-                ActionSpec::new(Verb::Sink)
-                    .summary("put the event: update in place by uid, or create")
-                    .requires("urn:cap:personal:calendar:write")
-                    .input(
-                        ArgSpec::new("uid")
-                            .summary("the event's stable uid, captured from the IRI")
-                            .binding(),
-                    )
-                    .input(ArgSpec::new("calendar").summary("the target calendar"))
-                    .input(
-                        ArgSpec::new("start")
-                            .summary("RFC 3339, or YYYY-MM-DD for all-day")
-                            .class("http://www.w3.org/2001/XMLSchema#dateTime"),
-                    )
-                    .input(
-                        ArgSpec::new("title")
-                            .summary("the event title (default: the piped content)")
-                            .optional(),
-                    )
-                    .input(
-                        ArgSpec::new("content")
-                            .summary("the title, when title= is absent")
-                            .optional(),
-                    )
-                    .input(
-                        ArgSpec::new("end")
-                            .summary("RFC 3339 (default: +1h, or all-day for a date start)")
-                            .class("http://www.w3.org/2001/XMLSchema#dateTime")
-                            .optional(),
-                    )
-                    .input(
-                        ArgSpec::new("location")
-                            .summary("absent clears the stored location")
-                            .optional(),
-                    )
-                    .input(
-                        ArgSpec::new("description")
-                            .summary("absent clears the stored notes")
-                            .optional(),
-                    )
-                    .input(
-                        ArgSpec::new("all_day")
-                            .class("http://www.w3.org/2001/XMLSchema#boolean")
-                            .optional(),
-                    )
-                    .input(
-                        ArgSpec::new("alert")
-                            .summary("alarms before start; absent clears the stored ones")
-                            .optional(),
-                    )
-                    .output("text/plain;charset=utf-8"),
-            )
-            .action(
-                ActionSpec::new(Verb::Delete)
-                    .summary("delete the event carrying this uid")
-                    .requires("urn:cap:personal:calendar:write")
-                    .input(
-                        ArgSpec::new("uid")
-                            .summary("the event's stable uid, captured from the IRI")
-                            .binding(),
-                    )
-                    .input(ArgSpec::new("calendar").summary("the target calendar"))
-                    .input(
-                        ArgSpec::new("start")
-                            .summary("window hint for the occurrence search")
-                            .class("http://www.w3.org/2001/XMLSchema#dateTime")
-                            .optional(),
-                    )
-                    .output("text/plain;charset=utf-8"),
-            ),
-    )
+        )
+        .verb(Verb::Sink)
+        .verb(Verb::Delete)
+        .verb(Verb::Meta)
+        .output("text/plain;charset=utf-8")
+        .action(needs(
+            ActionSpec::new(Verb::Sink)
+                .summary("put the event: update in place by uid, or create")
+                .requires("urn:cap:personal:calendar:write")
+                .input(
+                    ArgSpec::new("uid")
+                        .summary("the event's stable uid, captured from the IRI")
+                        .binding(),
+                )
+                .input(ArgSpec::new("calendar").summary("the target calendar"))
+                .input(
+                    ArgSpec::new("start")
+                        .summary("RFC 3339, or YYYY-MM-DD for all-day")
+                        .class("http://www.w3.org/2001/XMLSchema#dateTime"),
+                )
+                .input(
+                    ArgSpec::new("title")
+                        .summary("the event title (default: the piped content)")
+                        .optional(),
+                )
+                .input(
+                    ArgSpec::new("content")
+                        .summary("the title, when title= is absent")
+                        .optional(),
+                )
+                .input(
+                    ArgSpec::new("end")
+                        .summary("RFC 3339 (default: +1h, or all-day for a date start)")
+                        .class("http://www.w3.org/2001/XMLSchema#dateTime")
+                        .optional(),
+                )
+                .input(
+                    ArgSpec::new("location")
+                        .summary("absent clears the stored location")
+                        .optional(),
+                )
+                .input(
+                    ArgSpec::new("description")
+                        .summary("absent clears the stored notes")
+                        .optional(),
+                )
+                .input(
+                    ArgSpec::new("all_day")
+                        .class("http://www.w3.org/2001/XMLSchema#boolean")
+                        .optional(),
+                )
+                .input(
+                    ArgSpec::new("alert")
+                        .summary("alarms before start; absent clears the stored ones")
+                        .optional(),
+                )
+                .output("text/plain;charset=utf-8"),
+        ))
+        .action(needs(
+            ActionSpec::new(Verb::Delete)
+                .summary("delete the event carrying this uid")
+                .requires("urn:cap:personal:calendar:write")
+                .input(
+                    ArgSpec::new("uid")
+                        .summary("the event's stable uid, captured from the IRI")
+                        .binding(),
+                )
+                .input(ArgSpec::new("calendar").summary("the target calendar"))
+                .input(
+                    ArgSpec::new("start")
+                        .summary("window hint for the occurrence search")
+                        .class("http://www.w3.org/2001/XMLSchema#dateTime")
+                        .optional(),
+                )
+                .output("text/plain;charset=utf-8"),
+        ))
+}
+
+/// The capabilities a read or write through the configured remote calendar
+/// needs beyond the endpoint's own: its secrets and the network. Declared so the
+/// manifold offers the action only to a caller who can complete it.
+const REMOTE_READ_REQUIRES: [&str; 2] = ["urn:cap:secret:read:*", "urn:cap:net:*"];
+
+/// The configured remote calendar, when it names any source.
+fn remote_of(config: Option<&CalendarConfig>) -> Option<&remote::RemoteConfig> {
+    config
+        .and_then(|c| c.remote.as_ref())
+        .filter(|r| !r.is_empty())
 }
 
 /// `availability`: the free/busy projection for a period — busy blocks only,
-/// gated on `urn:cap:personal:calendar:read:freebusy`.
-pub fn availability(config: Option<CalendarConfig>) -> FnEndpoint {
-    FnEndpoint::new("availability", move |inv: &Invocation<'_>| {
-        let scope = read_scope("urn:personal:calendar", Some("freebusy"));
-        if !inv.capability.allows(&scope) {
-            return Err(denied("availability", &scope));
-        }
-        let Some((label, events)) = events_for(inv, config.as_ref())? else {
-            return resolve("availability", None);
-        };
-        Ok(Representation::new(
-            text_plain_utf8(),
-            format_freebusy(&label, &events).into_bytes(),
-        ))
+/// gated on `urn:cap:personal:calendar:read:freebusy`. With a remote calendar
+/// configured (a free/busy address, CalDAV), the busy blocks come from it instead
+/// of the operating system's store.
+pub fn availability(config: Option<CalendarConfig>) -> AsyncFnEndpoint {
+    let described = availability_description(config.as_ref());
+    let config = std::sync::Arc::new(config);
+    AsyncFnEndpoint::new("availability", move |inv: &Invocation<'_>| {
+        let config = config.clone();
+        Box::pin(async move {
+            let scope = read_scope("urn:personal:calendar", Some("freebusy"));
+            if !inv.capability.allows(&scope) {
+                return Err(denied("availability", &scope));
+            }
+            let Some(remote) = remote_of(config.as_ref().as_ref()) else {
+                let Some((label, events)) = events_for(inv, config.as_ref().as_ref())? else {
+                    return resolve("availability", None);
+                };
+                return Ok(Representation::new(
+                    text_plain_utf8(),
+                    format_freebusy(&label, &events).into_bytes(),
+                ));
+            };
+            // `calendar=` scopes the operating system's store; a remote source is one
+            // calendar already. Still read, so an unreadable value is refused.
+            let _ = inv.optional_str("calendar")?;
+            let period = inv
+                .bindings
+                .get("period")
+                .map(str::to_string)
+                .unwrap_or_else(|| "week".to_string());
+            let (start, end, label) = period_range(&period, Local::now().date_naive())?;
+            let busy = remote::busy(inv, remote, start, end).await?;
+            let mut body = format_freebusy(&label, &busy.events);
+            if busy.unexpanded > 0 {
+                body.push_str(&format!(
+                    "\n  note: {} recurring event(s) in the free/busy feed are not expanded; \
+                     only the first occurrence of each is shown as busy\n",
+                    busy.unexpanded
+                ));
+            }
+            Ok(Representation::new(text_plain_utf8(), body.into_bytes()))
+        })
     })
-    .with_description(
-        Description::new("availability")
-            .title("Availability")
-            .summary(
-                "Free/busy projection for a period (urn:personal:availability:{period}: \
-                 today, tomorrow, week, month, a month name, YYYY-MM, YYYY-MM-DD; bare = \
-                 week) — busy blocks only, no titles or attendees. Free events (birthdays, \
-                 holidays) are dropped. The same minimized view `calendar` yields under a \
-                 free/busy capability.",
-            )
-            .verb(Verb::Source)
-            .verb(Verb::Meta)
-            .input(
-                ArgSpec::new("period")
-                    .summary("the time window (default: week)")
-                    .binding(),
-            )
-            .requires("urn:cap:personal:calendar:read:freebusy")
-            .output("text/plain;charset=utf-8"),
-    )
+    .with_description(described)
+}
+
+fn availability_description(config: Option<&CalendarConfig>) -> Description {
+    let mut description = Description::new("availability")
+        .title("Availability")
+        .summary(
+            "Free/busy projection for a period (urn:personal:availability:{period}: \
+             today, tomorrow, week, month, a month name, YYYY-MM, YYYY-MM-DD; bare = \
+             week) — busy blocks only, no titles or attendees. Free events (birthdays, \
+             holidays) are dropped. The same minimized view `calendar` yields under a \
+             free/busy capability. With a remote calendar configured, read from its \
+             free/busy address or CalDAV collection.",
+        )
+        .verb(Verb::Source)
+        .verb(Verb::Meta)
+        .input(
+            ArgSpec::new("period")
+                .summary("the time window (default: week)")
+                .binding(),
+        )
+        .requires("urn:cap:personal:calendar:read:freebusy")
+        .output("text/plain;charset=utf-8");
+    if remote_of(config).is_some() {
+        for scope in REMOTE_READ_REQUIRES {
+            description = description.requires(scope);
+        }
+    }
+    description
 }
 
 /// Configuration for the consolidated-view calendar machinery — the
@@ -1087,7 +1190,9 @@ pub fn availability(config: Option<CalendarConfig>) -> FnEndpoint {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CalendarConfig {
     /// The derived, sync-owned view calendar the household subscribes to
-    /// (e.g. "Brian-Busy"). Never a source; regenerable.
+    /// (e.g. "Brian-Busy"). Never a source; regenerable. Blank or absent means
+    /// no view (a host that only reads a remote calendar has none).
+    #[serde(default)]
     pub view: String,
     /// Native calendars unioned into the view — an explicit allowlist, never
     /// "all calendars" (the view itself and the inbox live in the same store).
@@ -1100,6 +1205,11 @@ pub struct CalendarConfig {
     /// Absent: prefer an iCloud source, else the system default.
     #[serde(default)]
     pub account: Option<String>,
+    /// The calendar reached over the network, for a host without EventKit: a
+    /// free/busy address and/or a CalDAV collection, each named by secret (see
+    /// [`remote::RemoteConfig`]).
+    #[serde(default)]
+    pub remote: Option<remote::RemoteConfig>,
 }
 
 impl CalendarConfig {
@@ -1138,7 +1248,12 @@ pub fn calendars(config: Option<CalendarConfig>) -> FnEndpoint {
                 let name = inv
                     .optional_str("name")?
                     .map(str::to_string)
-                    .or_else(|| config.as_ref().map(|c| c.view.clone()))
+                    .or_else(|| {
+                        config
+                            .as_ref()
+                            .map(|c| c.view.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                    })
                     .ok_or_else(|| {
                         Error::Endpoint(
                             "urn:personal:calendars: no name= given and no view configured \
@@ -1247,6 +1362,7 @@ pub fn calendar_config(config: Option<CalendarConfig>) -> FnEndpoint {
             "sources": config.sources,
             "inbox": config.inbox,
             "account": config.account,
+            "remote": config.remote,
         });
         Ok(Representation::new(
             ReprType::new("application/json").with_param("charset", "utf-8"),
@@ -1294,7 +1410,7 @@ pub fn space(config: Option<CalendarConfig>) -> EndpointSpace {
         // as a period (first grammar match wins, and a final variable takes the rest).
         .bind(
             UriTemplate::parse("urn:personal:calendar:event:uid:{uid}").expect("valid template"),
-            calendar_event(),
+            calendar_event(config.clone()),
         )
         // AFTER the exact binds: the period grammar must not shadow
         // urn:personal:calendar:config (first grammar match wins).
@@ -1895,15 +2011,16 @@ mod tests {
                     }
                     request
                 };
-                let endpoint = match *resource {
-                    "calendar" => calendar(None),
-                    "availability" => availability(None),
-                    _ => calendars(Some(CalendarConfig {
+                let endpoint: Box<dyn Endpoint> = match *resource {
+                    "calendar" => Box::new(calendar(None)),
+                    "availability" => Box::new(availability(None)),
+                    _ => Box::new(calendars(Some(CalendarConfig {
                         view: "Work".into(),
                         sources: vec![],
                         inbox: None,
                         account: None,
-                    })),
+                        remote: None,
+                    }))),
                 };
                 let bindings = Bindings::new();
                 let capability = Capability::root();

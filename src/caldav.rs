@@ -4,14 +4,29 @@
 //! (so `urn:cap:net:<host>` gates and records every call) and hands the body
 //! back to a parser here.
 //!
-//! Limits: `TZID`-qualified times are read as local floating time (no tz
-//! database); recurrence expansion is delegated to the server;
-//! vCard/CardDAV is not covered.
-//! Not wired to `urn:http` yet: it carries only GET/HEAD/POST/PUT/PATCH/DELETE,
-//! not PROPFIND/REPORT. Not yet exercised against a real iCloud/Fastmail/Nextcloud/Radicale server.
+//! It also reads a published iCalendar feed (a free/busy address): VEVENTs and
+//! VFREEBUSY periods, through [`parse_feed`].
+//!
+//! Limits: a `TZID` that names an IANA zone (`America/Los_Angeles`) is resolved
+//! with the tz database; any other `TZID` (a Windows zone name) is read as local
+//! floating time. CalDAV recurrence expansion is delegated to the server
+//! (`<c:expand>`); a published feed is NOT expanded here, and [`parse_feed`] counts
+//! the recurring events it could not expand so the caller can say so.
+//! vCard/CardDAV is not covered. `crate::remote` carries these requests over
+//! `urn:http`; tested against canned server answers, not yet against a live
+//! iCloud/Fastmail/Nextcloud/Radicale server.
 
 use crate::platform::{occurrence_uid, CalendarInfo, EventInfo};
 use chrono::{Days, Duration, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+
+/// RFC 3986 unreserved characters stay; everything else in a uid is escaped, so a
+/// uid is always exactly one path segment.
+const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// One WebDAV request, ready for `urn:http`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,9 +95,48 @@ pub fn sync_collection(calendar: &str, token: &str) -> DavRequest {
     }
 }
 
-/// Resource path of an event inside a calendar collection.
+/// Resource path of an event inside a calendar collection. The uid is
+/// percent-encoded as one path segment.
 pub fn event_path(calendar: &str, uid: &str) -> String {
-    format!("{}/{}.ics", calendar.trim_end_matches('/'), uid)
+    format!(
+        "{}/{}.ics",
+        calendar.trim_end_matches('/'),
+        utf8_percent_encode(uid, SEGMENT)
+    )
+}
+
+/// PUT that replaces the event at its uid's path only while it is still the
+/// version read (`If-Match: <etag>`), or unconditionally when the server gave no
+/// entity tag.
+#[allow(clippy::too_many_arguments)]
+pub fn replace_event(
+    calendar: &str,
+    uid: &str,
+    etag: Option<&str>,
+    title: &str,
+    start_epoch: i64,
+    end_epoch: i64,
+    all_day: bool,
+    location: Option<&str>,
+    description: Option<&str>,
+    alerts: &[u32],
+) -> DavRequest {
+    let mut request = put_event(
+        calendar,
+        uid,
+        title,
+        start_epoch,
+        end_epoch,
+        all_day,
+        location,
+        description,
+        alerts,
+    );
+    request.headers.retain(|(name, _)| name != "If-None-Match");
+    if let Some(etag) = etag {
+        request.headers.push(("If-Match".into(), etag.into()));
+    }
+    request
 }
 
 /// PUT a new event (`If-None-Match: *` so it never overwrites).
@@ -420,6 +474,32 @@ fn local_rfc3339(n: NaiveDateTime) -> String {
         .unwrap_or_else(|| n.format("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
+/// The IANA zone a `TZID=` parameter names, if it names one the tz database knows.
+fn zone(p: &Prop) -> Option<chrono_tz::Tz> {
+    p.params
+        .split(unquoted(';'))
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(key, _)| key.eq_ignore_ascii_case("TZID"))
+        .and_then(|(_, value)| value.trim_matches('"').parse().ok())
+}
+
+/// A wall-clock time in `zone` (or local floating time without one) as a local
+/// RFC 3339 timestamp. A time skipped by a DST change is read just after the gap.
+fn wall_rfc3339(n: NaiveDateTime, zone: Option<chrono_tz::Tz>) -> String {
+    match zone {
+        Some(tz) => tz
+            .from_local_datetime(&n)
+            .earliest()
+            .or_else(|| tz.from_local_datetime(&(n + Duration::hours(1))).earliest())
+            .map(|t| {
+                t.with_timezone(&Local)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true)
+            })
+            .unwrap_or_else(|| local_rfc3339(n)),
+        None => local_rfc3339(n),
+    }
+}
+
 /// (rfc3339, is_date_only)
 fn parse_time(p: &Prop) -> Option<(String, bool)> {
     let v = p.value.trim();
@@ -433,7 +513,7 @@ fn parse_time(p: &Prop) -> Option<(String, bool)> {
         return Some((t.to_rfc3339_opts(SecondsFormat::Secs, true), false));
     }
     let n = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
-    Some((local_rfc3339(n), false))
+    Some((wall_rfc3339(n, zone(p)), false))
 }
 
 /// Positive iCalendar duration split into nominal days and elapsed time.
@@ -473,9 +553,10 @@ fn duration_parts(value: &str) -> Option<(Days, Duration)> {
     Some((Days::new(days), Duration::try_seconds(seconds)?))
 }
 
-fn duration_end(start: &Prop, all_day: bool, value: &str) -> Option<String> {
+fn duration_end(start_prop: &Prop, all_day: bool, value: &str) -> Option<String> {
     let (days, seconds) = duration_parts(value)?;
-    let start = start.value.trim();
+    let start_value = start_prop.value.trim();
+    let start = start_value;
     if all_day {
         if value.contains('T') {
             return None;
@@ -495,16 +576,19 @@ fn duration_end(start: &Prop, all_day: bool, value: &str) -> Option<String> {
         );
     }
     // Apply nominal days in calendar time before adding elapsed hours/minutes/seconds.
-    let start = NaiveDateTime::parse_from_str(start, "%Y%m%dT%H%M%S").ok()?;
+    let start = NaiveDateTime::parse_from_str(start_value, "%Y%m%dT%H%M%S").ok()?;
     let end_day = start.checked_add_days(days)?;
+    let wall = wall_rfc3339(end_day, zone(start_prop));
     if seconds.is_zero() {
-        return Some(local_rfc3339(end_day));
+        return Some(wall);
     }
-    let end = Local
-        .from_local_datetime(&end_day)
-        .earliest()?
+    let end = chrono::DateTime::parse_from_rfc3339(&wall)
+        .ok()?
         .checked_add_signed(seconds)?;
-    Some(end.to_rfc3339_opts(SecondsFormat::Secs, true))
+    Some(
+        end.with_timezone(&Local)
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+    )
 }
 
 fn trigger_minutes(v: &str) -> Option<u32> {
@@ -552,6 +636,150 @@ pub fn parse_ics(ics: &str, calendar: &str) -> Vec<EventInfo> {
             _ if !in_alarm || p.name == "TRIGGER" => {
                 if let Some(c) = cur.as_mut() {
                     c.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What a published iCalendar feed (a free/busy address) says about busy time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Feed {
+    /// Every VEVENT, and every VFREEBUSY period as an untitled event.
+    pub events: Vec<EventInfo>,
+    /// Recurring events (an RRULE or RDATE on a VEVENT) whose later occurrences are
+    /// NOT in `events`: a feed is not expanded here, so only each one's first
+    /// occurrence is. Zero for a VFREEBUSY feed, which the server expands.
+    pub unexpanded: usize,
+}
+
+/// Parse a published feed: the VEVENTs of a calendar export (Google's secret
+/// iCal address, an iCloud public calendar), and the FREEBUSY periods of a
+/// VFREEBUSY answer (a Fastmail free/busy link). `calendar` labels the events.
+pub fn parse_feed(ics: &str, calendar: &str) -> Feed {
+    let mut events = parse_ics(ics, calendar);
+    events.extend(parse_freebusy(ics, calendar));
+    Feed {
+        events,
+        unexpanded: count_recurring(ics),
+    }
+}
+
+/// VEVENTs that recur by rule or by date list (an override, RECURRENCE-ID, is
+/// one occurrence and does not count).
+fn count_recurring(ics: &str) -> usize {
+    let mut count = 0;
+    let mut recurs = false;
+    let mut in_event = false;
+    for p in unfold(ics) {
+        match (p.name.as_str(), p.value.trim()) {
+            ("BEGIN", "VEVENT") => {
+                in_event = true;
+                recurs = false;
+            }
+            ("END", "VEVENT") => {
+                if in_event && recurs {
+                    count += 1;
+                }
+                in_event = false;
+            }
+            ("RRULE", _) | ("RDATE", _) if in_event => recurs = true,
+            _ => {}
+        }
+    }
+    count
+}
+
+/// One FREEBUSY period, `start/end` or `start/duration`, as unix seconds. RFC
+/// 5545 writes these in UTC; a period without the `Z` is read as local time.
+fn freebusy_period(value: &str) -> Option<(i64, i64)> {
+    let (start, rest) = value.trim().split_once('/')?;
+    let epoch = |v: &str| -> Option<i64> {
+        let v = v.trim();
+        match v.strip_suffix('Z') {
+            Some(z) => Some(
+                Utc.from_utc_datetime(&NaiveDateTime::parse_from_str(z, "%Y%m%dT%H%M%S").ok()?)
+                    .timestamp(),
+            ),
+            None => Some(
+                Local
+                    .from_local_datetime(&NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?)
+                    .earliest()?
+                    .timestamp(),
+            ),
+        }
+    };
+    let start = epoch(start)?;
+    let end = if rest.trim_start().starts_with(['P', '+']) {
+        let (_, elapsed) = duration_parts(rest)?;
+        start
+            .checked_add(duration_days(rest)?.checked_mul(86_400)?)?
+            .checked_add(elapsed.num_seconds())?
+    } else {
+        epoch(rest)?
+    };
+    (end > start).then_some((start, end))
+}
+
+/// The whole days of a duration (`P2D`, `P1W`), for a FREEBUSY period, where a
+/// day is 86,400 seconds because the period is in UTC.
+fn duration_days(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let value = value.strip_prefix('+').unwrap_or(value).strip_prefix('P')?;
+    if let Some(weeks) = value.strip_suffix('W') {
+        return weeks.parse::<i64>().ok()?.checked_mul(7);
+    }
+    let date = value.split('T').next().unwrap_or("");
+    match date.strip_suffix('D') {
+        Some(days) => days.parse().ok(),
+        None => Some(0),
+    }
+}
+
+/// The busy periods of every VFREEBUSY component. FBTYPE=FREE is dropped; BUSY,
+/// BUSY-TENTATIVE, BUSY-UNAVAILABLE and an absent FBTYPE are busy.
+pub fn parse_freebusy(ics: &str, calendar: &str) -> Vec<EventInfo> {
+    let rfc = |epoch: i64| {
+        Local
+            .timestamp_opt(epoch, 0)
+            .single()
+            .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    let mut inside = false;
+    for p in unfold(ics) {
+        match (p.name.as_str(), p.value.trim()) {
+            ("BEGIN", "VFREEBUSY") => inside = true,
+            ("END", "VFREEBUSY") => inside = false,
+            ("FREEBUSY", periods) if inside => {
+                let free = p
+                    .params
+                    .split(unquoted(';'))
+                    .filter_map(|kv| kv.split_once('='))
+                    .any(|(k, v)| {
+                        k.eq_ignore_ascii_case("FBTYPE") && v.eq_ignore_ascii_case("FREE")
+                    });
+                if free {
+                    continue;
+                }
+                for (start, end) in periods.split(',').filter_map(freebusy_period) {
+                    out.push(EventInfo {
+                        uid: format!("freebusy-{start}-{end}"),
+                        title: String::new(),
+                        calendar: calendar.to_string(),
+                        start: rfc(start),
+                        end: rfc(end),
+                        all_day: false,
+                        busy: true,
+                        location: None,
+                        description: None,
+                        url: None,
+                        attendees: Vec::new(),
+                        alerts: Vec::new(),
+                    });
                 }
             }
             _ => {}
@@ -774,6 +1002,64 @@ mod tests {
         assert_eq!(tok.as_deref(), Some("http://x/sync/42"));
         assert_eq!((r[0].status, r[1].status), (404, 200));
         assert_eq!(r[1].etag.as_deref(), Some("\"z\""));
+    }
+
+    fn epoch(s: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp()
+    }
+
+    #[test]
+    fn an_iana_tzid_is_resolved_on_both_sides_of_a_dst_change() {
+        // 2026-11-01 is the US fall-back: 09:00 Los Angeles is 16:00Z the day
+        // before and 17:00Z the day after, whatever zone this host runs in.
+        let ics = concat!(
+            "BEGIN:VEVENT\r\nUID:a\r\nDTSTART;TZID=America/Los_Angeles:20261031T090000\r\n",
+            "DURATION:PT1H\r\nEND:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:b\r\nDTSTART;TZID=\"America/Los_Angeles\":20261102T090000\r\n",
+            "DTEND;TZID=America/Los_Angeles:20261102T100000\r\nEND:VEVENT\r\n",
+        );
+        let events = parse_ics(ics, "Z");
+        assert_eq!(epoch(&events[0].start), epoch("2026-10-31T16:00:00Z"));
+        assert_eq!(epoch(&events[0].end), epoch("2026-10-31T17:00:00Z"));
+        assert_eq!(epoch(&events[1].start), epoch("2026-11-02T17:00:00Z"));
+        assert_eq!(epoch(&events[1].end), epoch("2026-11-02T18:00:00Z"));
+    }
+
+    #[test]
+    fn a_tzid_the_database_does_not_know_reads_as_local_time() {
+        let ics =
+            "BEGIN:VEVENT\nUID:w\nDTSTART;TZID=Pacific Standard Time:20261201T090000\nEND:VEVENT\n";
+        let events = parse_ics(ics, "Z");
+        let local = chrono::Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 12, 1)
+                    .unwrap()
+                    .and_hms_opt(9, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap()
+            .timestamp();
+        assert_eq!(epoch(&events[0].start), local);
+    }
+
+    #[test]
+    fn a_feed_counts_recurring_masters_but_not_overrides() {
+        let ics = concat!(
+            "BEGIN:VEVENT\nUID:r\nDTSTART:20261201T100000Z\nRRULE:FREQ=DAILY\nEND:VEVENT\n",
+            "BEGIN:VEVENT\nUID:r\nRECURRENCE-ID:20261202T100000Z\nDTSTART:20261202T110000Z\nEND:VEVENT\n",
+            "BEGIN:VEVENT\nUID:d\nDTSTART:20261201T100000Z\nRDATE:20261205T100000Z\nEND:VEVENT\n",
+        );
+        assert_eq!(parse_feed(ics, "F").unexpanded, 2);
+    }
+
+    #[test]
+    fn a_uid_is_one_path_segment() {
+        assert_eq!(
+            event_path("https://dav.example.test/cal/", "a/b c@d"),
+            "https://dav.example.test/cal/a%2Fb%20c%40d.ics"
+        );
+        assert_eq!(event_path("/c", "s-1_2.3~"), "/c/s-1_2.3~.ics");
     }
 
     #[test]
