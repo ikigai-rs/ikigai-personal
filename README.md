@@ -104,12 +104,62 @@ source allowlist, the capture inbox, and the account:
 `Sink urn:personal:calendars` with no arguments creates the configured view
 calendar on the configured account.
 
+## A calendar off the machine: free/busy addresses and CalDAV
+
+A host without EventKit (a Linux server, a hosted teacher) reads busy time
+from the calendar the person ALREADY uses, never a separate one, and writes
+sessions into it by uid. Configure it under `remote` in the calendar file.
+**Every value is the NAME of a secret** in `urn:secret:*` (ikigai-secret): the
+file holds no URL and no credential.
+
+```json
+{ "remote": {
+    "freebusy": ["teacher-freebusy-url"],
+    "caldav": { "calendar": "Teaching", "url": "teaching-caldav-url",
+                "user": "teaching-caldav-user", "password": "teaching-caldav-password" } } }
+```
+
+- **`freebusy`**: secrets that each hold a published iCalendar URL (Google's
+  secret iCal address, an iCloud public calendar, whose `webcal://` is fetched
+  as `https://`, or a free/busy link that answers VFREEBUSY). Read-only, no
+  OAuth. Their busy blocks are unioned. VEVENTs and FREEBUSY periods are both
+  read, and a `TZID` naming an IANA zone is resolved with the tz database.
+- **`caldav`**: one calendar collection. `urn:personal:availability` reads it
+  with a `calendar-query` REPORT (the server expands recurrences). A write to
+  `urn:personal:calendar:event:uid:{uid}` whose `calendar=` matches `calendar`
+  goes to `{collection}/{uid}.ics`: a GET says whether it exists, then a PUT
+  creates it (`If-None-Match: *`) or replaces the version read (`If-Match`). A
+  concurrent edit on the server is a Conflict, never an overwrite. Delete removes
+  it.
+- With `remote` configured, `urn:personal:availability` answers from it
+  instead of the operating system's store. `urn:personal:calendar` (detail,
+  Turtle) still reads only the platform store.
+- Everything crosses the kernel under the CALLER's capability: the secrets
+  through `urn:secret:{name}` (`urn:cap:secret:read:<name>`) and the requests
+  through `urn:http:*` (`urn:cap:net:<host>`; a write also needs
+  `urn:cap:kernel:cut`). The actions declare these, so a capability that could
+  not finish a read or write is not offered it. A source that fails fails the
+  read: a missing source would read as free time.
+
+Limits, stated:
+
+- **A published feed is not expanded here.** A recurring event in a feed
+  (RRULE, RDATE) shows only its first occurrence, and the answer ends with a
+  `note:` line counting such events. RRULE expansion belongs in the shared time
+  module; until it lands, prefer CalDAV, whose server expands, or a VFREEBUSY
+  link.
+- A `TZID` that is not an IANA name (a Windows zone name) is read as the host's
+  local time.
+- The free/busy text prints times in the HOST's zone, without naming it.
+- Tested against canned server answers shaped like each provider's, not yet
+  against a live Google, iCloud or Fastmail account.
+
 ## Platform support
 
 | platform | status |
 |----------|--------|
 | **macOS** | real EventKit (objc2): list/create calendars, read/search/write/delete events, alarms, TCC full-access flow, one reused store per thread, store-change observation API |
-| **Windows / Linux** | placeholders — build cleanly, resolve to a clear "not supported yet" error |
+| **Windows / Linux** | no platform store — build cleanly and resolve to a clear "not supported yet" error, except availability and writes by uid through a configured remote calendar (above) |
 
 Adding a backend means filling in one file under `src/platform/` — the seam and
 the rest of the crate don't change. The put-by-uid decision is platform-neutral (`src/store.rs`) and tested against

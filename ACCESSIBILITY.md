@@ -25,6 +25,11 @@ and how to report a barrier. It is not a conformance claim. Adapted from the
   in <calendar>`, `removed "<title>" from <calendar>`, `created calendar "<name>" on <account>`;
   and from a put by uid (`src/store.rs`): `created "<title>" in <calendar>`, `updated "<title>" in
   <calendar>`, or `updated "<title>" in <calendar>: moved to its new time`.
+  Through a CalDAV calendar (`src/remote.rs`): the same three, and `removed the event with uid
+  <uid> from <calendar>`.
+- **Remote availability notes** (`src/lib.rs`): when a free/busy feed holds recurring events it
+  cannot expand, the free/busy answer ends with `note: <n> recurring event(s) in the free/busy
+  feed are not expanded; only the first occurrence of each is shown as busy`.
 - **Contacts** (`urn:personal:contacts`): sample data today, headed `personal contacts (sample
   data — Contacts/EventKit integration pending)`.
 - **Refusals**: the `Error` sentences in `src/lib.rs` (an unknown period, a missing capability, a
@@ -76,6 +81,8 @@ included in that command. CI repeats these unit tests through
 | Unknown-period refusal | Pass | `an_unknown_period_is_rejected_at_the_grammar`: asserts `unknown period` in the error; does not evaluate the full guidance or its readability. |
 | Config response and missing-config guidance | Pass | `the_config_resource_reports_or_guides`: parses the JSON view and asserts the missing-config error names `.config/ikigai/calendar.json`. Does not evaluate JSON navigation in a host. |
 | Put-by-uid confirmations in words | Pass | `store::tests::confirmations_say_what_happened_in_words`: asserts the created, updated and moved sentences, each saying what happened without relying on layout. Does not test how a host presents them. |
+| Remote availability says what it could not show | Pass | `remote::tests::a_google_secret_address_gives_busy_blocks_in_the_right_zone`: asserts the `note:` sentence for an unexpanded recurring event, and that no title reaches the free/busy face. Does not test how a host presents it. |
+| A write to the wrong calendar names the right one | Pass | `remote::tests::a_host_without_a_platform_store_names_its_caldav_calendar` (runs off macOS): the refusal names the configured CalDAV calendar. |
 | Remaining output rules and end-to-end backend text | Blocked | No complete output audit or live EventKit session was performed for this update. The unit tests above do not verify every refusal, write confirmation, calendar list, contacts text, observer message, empty detail period, Turtle or CalDAV output for accessibility. |
 | Documentation and host rendering in a browser or terminal | Blocked | No interactive rendering session was used for this update. Heading navigation, keyboard access, contrast, zoom, reflow and text spacing in GitHub, editors and consuming hosts remain unverified. This crate supplies no HTML or SVG interface. |
 | Automated accessibility checker | Blocked | No browser or terminal accessibility checker has been run on this output; no checker harness is configured here. Rust unit tests are not an accessibility checker. |
